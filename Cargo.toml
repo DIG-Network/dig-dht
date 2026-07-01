@@ -1,0 +1,64 @@
+# dig-dht — a Kademlia DHT with PROVIDER RECORDS for the DIG Node peer network.
+#
+# The DHT answers one question: "which peers hold this content?" A node holding a `.dig` capsule /
+# store / root PUTs a provider record keyed by a CONTENT ID; a node wanting that content does an
+# iterative `find_providers(content_id)` lookup and gets back the set of `peer_id`s (with candidate
+# addresses) holding it — then fetches the bytes over the L7 peer RPC (`dig.getAvailability` /
+# `dig.fetchRange`, served over dig-nat mTLS connections). The DHT locates peers; dig-nat + the peer
+# RPC move the bytes.
+#
+# Dependency philosophy (mirrors dig-nat's): keep the tree SMALL. The DHT rides dig-nat's transport
+# (its `PeerId`, `PeerConnection`, `PeerSession` mux, and mTLS dial) and reuses ONE `PeerId` type
+# from it — NOT the whole gossip stack. dig-gossip (and dig-constants) pull the entire
+# chia-protocol/consensus stack, which a pure-Kademlia crate does not need; the DHT deliberately
+# depends only on dig-nat so the tree stays minimal. The DHT's own wire (4 RPC methods) is small
+# length-prefixed JSON, aligned to the L7 peer-network style, and is tested end-to-end over an
+# in-memory transport harness (NO real network).
+[package]
+name = "dig-dht"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75.0"
+license = "Apache-2.0 OR MIT"
+description = "Kademlia DHT with provider records for the DIG Node peer network — maps DIG content (store / capsule / root / resource) to the peer_ids holding it, so a node can locate which peers have the content it wants and fetch it over the L7 peer RPC. peer_id = SHA-256(TLS SPKI DER), XOR-distance k-buckets, iterative find_node/find_providers, TTL'd + republished provider records, riding dig-nat mTLS transport."
+repository = "https://github.com/DIG-Network/dig-dht"
+readme = "README.md"
+keywords = ["dht", "kademlia", "p2p", "provider", "dig"]
+categories = ["network-programming"]
+
+[dependencies]
+# Peer identity (peer_id = SHA-256(TLS SPKI DER)) + the mTLS transport the DHT RPC rides. The DHT
+# keys its k-buckets by dig-nat's `PeerId` and carries its RPC over dig-nat `PeerConnection` streams.
+#
+# Sourcing: like dig-nat itself, dig-nat is not yet on crates.io, so we resolve from the DIG-Network
+# git repo for both the standalone CI checkout and the superproject build. `version = "0.1"` is what
+# `cargo publish` records. RELEASE ORDERING (ecosystem rule: release-first for shared contracts):
+# dig-nat (and dig-constants 0.2.x) must be published to crates.io, and these `git` sources swapped
+# for the plain crates.io versions, BEFORE dig-dht is published — `cargo publish` rejects a git
+# dependency, so the publish workflow enforces this. The orchestrator sequences the release tags.
+dig-nat = { version = "0.1", git = "https://github.com/DIG-Network/dig-nat" }
+
+# Async runtime for the service task + maintenance timers + lookup fan-out.
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "sync", "io-util"] }
+async-trait = "0.1"
+
+# The DHT RPC wire: small length-prefixed JSON messages (aligned to the L7 peer-network style).
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Content-id hashing into the 256-bit keyspace (SHA-256, same digest family as peer_id).
+sha2 = "0.10"
+
+# Bucket-refresh jitter + random target selection for periodic self-lookup.
+rand = "0.8"
+
+# Structured errors + observability.
+thiserror = "2"
+tracing = "0.1"
+
+[dev-dependencies]
+# The in-memory transport harness spins up many virtual nodes in one process (NO real network).
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "test-util"] }
+
+[profile.release]
+overflow-checks = true
