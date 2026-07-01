@@ -215,13 +215,13 @@ impl RoutingTable {
     /// This is the seed set for an iterative lookup and the answer to a `find_node`. It scans all
     /// buckets (256 × ≤ k contacts) and returns the `k` with the smallest distance to `target`.
     pub fn closest(&self, target: &Key) -> Vec<Contact> {
-        let mut all: Vec<(Contact, _)> = self
+        let mut all: Vec<(Contact, crate::key::Distance)> = self
             .buckets
             .iter()
             .flat_map(|b| b.contacts.iter())
             .filter_map(|c| c.key().map(|k| (c.clone(), target.distance(&k))))
             .collect();
-        all.sort_by(|a, b| a.1.cmp(&b.1));
+        all.sort_by_key(|(_, dist)| *dist);
         all.into_iter().take(self.k).map(|(c, _)| c).collect()
     }
 

@@ -185,7 +185,7 @@ fn mark_queried(shortlist: &mut [ShortlistEntry], peer_id: &str, failed: bool) {
 /// Keep the shortlist sorted closest-first and bounded. We keep more than `k` so late-arriving
 /// closer contacts still have room, but cap it to avoid unbounded growth on a large network.
 fn sort_and_cap(shortlist: &mut Vec<ShortlistEntry>, k: usize, alpha: usize) {
-    shortlist.sort_by(|a, b| a.distance.cmp(&b.distance));
+    shortlist.sort_by_key(|e| e.distance);
     // A generous cap: the k closest we will return, plus headroom for α parallel probes and their
     // returned neighbours. Bounds memory without discarding a contact that could still be in the top-k.
     let cap = (k * 3).max(k + alpha * 2);
