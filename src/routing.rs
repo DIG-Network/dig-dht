@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use dig_nat::PeerId;
 
 use crate::key::Key;
-use crate::record::CandidateAddr;
+use crate::record::{sort_addresses_ipv6_first, CandidateAddr};
 
 /// A known peer in the routing table / on the wire: its `peer_id` (64-hex) and candidate addresses.
 ///
@@ -28,13 +28,19 @@ use crate::record::CandidateAddr;
 pub struct Contact {
     /// The peer's identity — 64-hex `peer_id = SHA-256(SPKI DER)`.
     pub peer_id: String,
-    /// Candidate addresses to reach the peer (most-direct-first is not guaranteed — consumer sorts).
+    /// Candidate addresses to reach the peer. Ordered IPv6-first, then most-direct-first by
+    /// [`AddressKind::rank`](crate::record::AddressKind::rank) when built via [`Contact::new`]; a
+    /// `Contact` deserialized directly from the wire (bypassing `new`) is not guaranteed sorted, so
+    /// a consumer that cannot assume a conforming producer should still sort defensively.
     pub addresses: Vec<CandidateAddr>,
 }
 
 impl Contact {
-    /// Build a contact from a decoded [`PeerId`] and its candidate addresses.
-    pub fn new(peer_id: &PeerId, addresses: Vec<CandidateAddr>) -> Self {
+    /// Build a contact from a decoded [`PeerId`] and its candidate addresses. `addresses` is sorted
+    /// IPv6-first-then-rank (see `sort_addresses_ipv6_first`) — ecosystem-wide IPv6-first,
+    /// IPv4-fallback for peer communication.
+    pub fn new(peer_id: &PeerId, mut addresses: Vec<CandidateAddr>) -> Self {
+        sort_addresses_ipv6_first(&mut addresses);
         Contact {
             peer_id: peer_id.to_hex(),
             addresses,
@@ -51,12 +57,10 @@ impl Contact {
         self.peer_id().as_ref().map(Key::from_peer_id)
     }
 
-    /// The most-direct dialable candidate address, if any.
+    /// The IPv6-preferred, most-direct dialable candidate address, if any. `addresses` is already
+    /// IPv6-first-then-rank sorted, so this is simply the first dialable entry.
     pub fn best_address(&self) -> Option<&CandidateAddr> {
-        self.addresses
-            .iter()
-            .filter(|a| a.kind.is_dialable())
-            .min_by_key(|a| a.kind.rank())
+        self.addresses.iter().find(|a| a.kind.is_dialable())
     }
 }
 
@@ -250,7 +254,7 @@ impl RoutingTable {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::record::CandidateAddr;
+    use crate::record::{AddressKind, CandidateAddr};
 
     fn pid(bytes: [u8; 32]) -> PeerId {
         PeerId::from_bytes(bytes)
@@ -442,5 +446,44 @@ mod tests {
     #[allow(non_snake_case)]
     fn AddressKindDirect() -> crate::record::AddressKind {
         crate::record::AddressKind::Direct
+    }
+
+    #[test]
+    fn contact_new_sorts_addresses_ipv6_first() {
+        let c = Contact::new(
+            &pid([1u8; 32]),
+            vec![
+                CandidateAddr::direct("203.0.113.7", 9444), // IPv4 direct, fed first
+                CandidateAddr::direct("2001:db8::1", 9444), // IPv6 direct, fed second
+                CandidateAddr {
+                    host: "198.51.100.2".into(),
+                    port: 1,
+                    kind: AddressKind::Reflexive,
+                },
+                CandidateAddr {
+                    host: "2001:db8::2".into(),
+                    port: 1,
+                    kind: AddressKind::Reflexive,
+                },
+            ],
+        );
+        let hosts: Vec<&str> = c.addresses.iter().map(|a| a.host.as_str()).collect();
+        assert_eq!(
+            hosts,
+            vec!["2001:db8::1", "2001:db8::2", "203.0.113.7", "198.51.100.2"],
+            "contact addresses must be IPv6-first, then ranked by AddressKind"
+        );
+    }
+
+    #[test]
+    fn contact_best_address_prefers_ipv6_over_ipv4_at_same_rank() {
+        let c = Contact::new(
+            &pid([1u8; 32]),
+            vec![
+                CandidateAddr::direct("203.0.113.7", 9444), // IPv4 direct, fed first
+                CandidateAddr::direct("2001:db8::1", 9444), // IPv6 direct, fed second
+            ],
+        );
+        assert_eq!(c.best_address().unwrap().host, "2001:db8::1");
     }
 }

@@ -12,6 +12,8 @@
 //! L7 peer-network `dig.getPeers` `addresses[]` shape (§7), so a record's addresses drop straight
 //! into a `PeerTarget` for [`dig_nat::connect`].
 
+use std::net::IpAddr;
+
 use serde::{Deserialize, Serialize};
 
 use dig_nat::PeerId;
@@ -79,6 +81,31 @@ impl CandidateAddr {
             kind: AddressKind::Relay,
         }
     }
+
+    /// Whether `host` parses as a literal IPv6 address.
+    ///
+    /// Peer communication is **IPv6-first, IPv4-fallback** (ecosystem hard rule): candidate lists
+    /// are ordered so IPv6 literals sort before IPv4 literals (and before hostnames, which parse as
+    /// neither). This is a real `IpAddr` parse, not a `contains(':')` heuristic, so it is not fooled
+    /// by bracketed `[::1]` forms or other punctuation.
+    fn is_ipv6_literal(&self) -> bool {
+        matches!(self.host.parse::<IpAddr>(), Ok(IpAddr::V6(_)))
+    }
+
+    /// Sort key for IPv6-first, then-by-[`AddressKind::rank`] ordering: `(family_rank, kind_rank)`
+    /// where an IPv6 literal sorts before anything else (IPv4 literal or hostname).
+    fn family_then_kind_rank(&self) -> (u8, u8) {
+        let family_rank = u8::from(!self.is_ipv6_literal());
+        (family_rank, self.kind.rank())
+    }
+}
+
+/// Sort `addresses` **IPv6-first, then by [`AddressKind::rank`]** — the ecosystem-wide IPv6-first,
+/// IPv4-fallback rule for peer communication. Used by both [`ProviderRecord::new`] and
+/// [`crate::routing::Contact::new`] so provider and routing-table address lists share one ordering
+/// policy. This only reorders the list; the wire shape of each [`CandidateAddr`] is unchanged.
+pub(crate) fn sort_addresses_ipv6_first(addresses: &mut [CandidateAddr]) {
+    addresses.sort_by_key(CandidateAddr::family_then_kind_rank);
 }
 
 /// The DHT's stored value: peer `provider_peer_id` holds the content whose key is `content_key`,
@@ -98,8 +125,10 @@ pub struct ProviderRecord {
     pub content_key: String,
     /// The holder's `peer_id` (64-hex).
     pub provider_peer_id: String,
-    /// Candidate addresses to reach the holder (most-direct-first is not guaranteed on the wire —
-    /// the consumer sorts by [`AddressKind::rank`]).
+    /// Candidate addresses to reach the holder. Ordered IPv6-first, then most-direct-first by
+    /// [`AddressKind::rank`] when built via [`ProviderRecord::new`]; a record deserialized directly
+    /// from the wire (bypassing `new`) is not guaranteed sorted, so a consumer that cannot assume a
+    /// conforming producer should still sort defensively.
     pub addresses: Vec<CandidateAddr>,
     /// Absolute expiry (Unix seconds). A record at/after this time is stale.
     pub expires_at: u64,
@@ -111,9 +140,10 @@ impl ProviderRecord {
     pub fn new(
         content_key: &crate::key::Key,
         provider: &PeerId,
-        addresses: Vec<CandidateAddr>,
+        mut addresses: Vec<CandidateAddr>,
         expires_at: u64,
     ) -> Self {
+        sort_addresses_ipv6_first(&mut addresses);
         ProviderRecord {
             content_key: content_key.to_hex(),
             provider_peer_id: provider.to_hex(),
@@ -132,12 +162,11 @@ impl ProviderRecord {
         now >= self.expires_at
     }
 
-    /// The most-direct dialable candidate address, if any (the address a finder dials first).
+    /// The IPv6-preferred, most-direct dialable candidate address, if any — the address a finder
+    /// dials first. `addresses` is already IPv6-first-then-rank sorted (`sort_addresses_ipv6_first`),
+    /// so this is simply the first dialable entry.
     pub fn best_address(&self) -> Option<&CandidateAddr> {
-        self.addresses
-            .iter()
-            .filter(|a| a.kind.is_dialable())
-            .min_by_key(|a| a.kind.rank())
+        self.addresses.iter().find(|a| a.kind.is_dialable())
     }
 }
 
@@ -228,5 +257,51 @@ mod tests {
         assert!(AddressKind::Reflexive.rank() < AddressKind::Relay.rank());
         assert!(!AddressKind::Relay.is_dialable());
         assert!(AddressKind::Direct.is_dialable());
+    }
+
+    #[test]
+    fn provider_record_new_sorts_addresses_ipv6_first() {
+        // Fed in IPv4-first order; the stored list must come out IPv6-first, then by rank.
+        let key = Key::from_bytes([0u8; 32]);
+        let rec = ProviderRecord::new(
+            &key,
+            &pid(1),
+            vec![
+                CandidateAddr::direct("203.0.113.7", 9444), // IPv4 direct
+                CandidateAddr::direct("2001:db8::1", 9444), // IPv6 direct
+                CandidateAddr {
+                    host: "198.51.100.2".into(),
+                    port: 1,
+                    kind: AddressKind::Reflexive,
+                }, // IPv4 reflexive
+                CandidateAddr {
+                    host: "2001:db8::2".into(),
+                    port: 1,
+                    kind: AddressKind::Reflexive,
+                }, // IPv6 reflexive
+            ],
+            10,
+        );
+        let hosts: Vec<&str> = rec.addresses.iter().map(|a| a.host.as_str()).collect();
+        assert_eq!(
+            hosts,
+            vec!["2001:db8::1", "2001:db8::2", "203.0.113.7", "198.51.100.2"],
+            "addresses must be IPv6-first, then ranked by AddressKind"
+        );
+    }
+
+    #[test]
+    fn best_address_prefers_ipv6_over_ipv4_at_same_rank() {
+        let key = Key::from_bytes([0u8; 32]);
+        let rec = ProviderRecord::new(
+            &key,
+            &pid(1),
+            vec![
+                CandidateAddr::direct("203.0.113.7", 9444), // IPv4 direct, fed first
+                CandidateAddr::direct("2001:db8::1", 9444), // IPv6 direct, fed second
+            ],
+            10,
+        );
+        assert_eq!(rec.best_address().unwrap().host, "2001:db8::1");
     }
 }
