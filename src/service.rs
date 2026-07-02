@@ -311,6 +311,10 @@ impl DhtService {
         caller: Option<Contact>,
         request: DhtRequest,
     ) -> DhtResponse {
+        // The authenticated caller's peer_id (if any), kept for the AddProvider self-announce check
+        // below — taken BEFORE the caller Contact is (conditionally) moved into the routing table.
+        let caller_peer_id = caller.as_ref().map(|c| c.peer_id.clone());
+
         // Learn the (authenticated) caller — every inbound RPC is evidence the caller is alive.
         // Cap its address list at the boundary (SPEC §5.5, §14): a `Contact` decoded off the wire
         // bypasses `Contact::new`'s cap entirely (its fields are public), so an uncapped caller
@@ -347,6 +351,24 @@ impl DhtService {
                 DhtResponse::Providers { providers, closer }
             }
             DhtRequest::AddProvider { mut record } => {
+                // Self-announce check (SPEC §6.4, §14): when the caller identity is known (an
+                // authenticated transport), the record's provider_peer_id MUST be the caller itself.
+                // ProviderRecord carries no signature, so without this check any authenticated caller
+                // could announce an arbitrary THIRD-PARTY peer_id as a provider of arbitrary content
+                // at attacker-chosen addresses — provider-set poisoning. A caller we cannot identify
+                // (`handle_request`, no transport-supplied identity) cannot be checked and is let
+                // through unchanged — that path already deviates from the mTLS-authenticated model.
+                if let Some(caller_id) = &caller_peer_id {
+                    if *caller_id != record.provider_peer_id {
+                        return DhtResponse::Error {
+                            code: 4,
+                            message:
+                                "add_provider: provider_peer_id must match the authenticated caller"
+                                    .into(),
+                        };
+                    }
+                }
+
                 // Cap the address list at the boundary BEFORE anything else (SPEC §5.5, §14): a
                 // `ProviderRecord` decoded off the wire bypasses `ProviderRecord::new`'s cap (its
                 // fields are public), so an attacker could otherwise pack thousands of addresses into

@@ -510,6 +510,79 @@ async fn add_provider_with_unbounded_addresses_is_capped_at_the_boundary() {
 }
 
 #[tokio::test]
+async fn add_provider_naming_a_third_party_provider_is_rejected() {
+    // LOW (SECURITY_AUDIT_P2P.md #179): an authenticated caller announcing a record whose
+    // provider_peer_id is a DIFFERENT peer (unsigned, self-asserted) is provider-set poisoning —
+    // it lets a caller point finders at an arbitrary third-party address for content that peer
+    // never actually announced. The responder must reject unless caller == provider_peer_id.
+    let router = SwarmRouter::new();
+    let config = DhtConfig::default();
+    let victim = make_node(&router, pid(0x30, 0), config).await;
+
+    let caller = Contact::new(&pid(0x31, 0), addr());
+    let third_party = pid(0x32, 0); // NOT the caller
+    let content = ContentId::store([0x55; 32]);
+    let record = dig_dht::ProviderRecord::new(&content.to_key(), &third_party, addr(), u64::MAX);
+
+    let resp = victim
+        .handle_request_from(Some(caller), DhtRequest::AddProvider { record })
+        .await;
+    match resp {
+        DhtResponse::Error { .. } => {}
+        other => panic!("expected an Error response for third-party announce, got {other:?}"),
+    }
+
+    // Confirm it was never stored.
+    let key = content.to_key();
+    let resp = victim
+        .handle_request(DhtRequest::FindProviders {
+            content_key: key.to_hex(),
+        })
+        .await;
+    match resp {
+        DhtResponse::Providers { providers, .. } => assert!(
+            providers.is_empty(),
+            "third-party-named record must not be stored"
+        ),
+        other => panic!("expected Providers, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn add_provider_self_announce_is_accepted() {
+    // The common case: caller announces ITS OWN peer_id as the provider — must still work.
+    let router = SwarmRouter::new();
+    let config = DhtConfig::default();
+    let victim = make_node(&router, pid(0x33, 0), config).await;
+
+    let announcer_id = pid(0x34, 0);
+    let caller = Contact::new(&announcer_id, addr());
+    let content = ContentId::store([0x56; 32]);
+    let record = dig_dht::ProviderRecord::new(&content.to_key(), &announcer_id, addr(), u64::MAX);
+
+    let resp = victim
+        .handle_request_from(Some(caller), DhtRequest::AddProvider { record })
+        .await;
+    assert_eq!(resp, DhtResponse::AddProviderOk);
+}
+
+#[tokio::test]
+async fn add_provider_with_no_authenticated_caller_is_still_accepted() {
+    // handle_request (no caller supplied, e.g. a transport that cannot authenticate) must keep
+    // working -- the caller==provider check only applies when a caller identity IS available.
+    let router = SwarmRouter::new();
+    let config = DhtConfig::default();
+    let victim = make_node(&router, pid(0x35, 0), config).await;
+
+    let content = ContentId::store([0x57; 32]);
+    let record = dig_dht::ProviderRecord::new(&content.to_key(), &pid(0x36, 0), addr(), u64::MAX);
+    let resp = victim
+        .handle_request(DhtRequest::AddProvider { record })
+        .await;
+    assert_eq!(resp, DhtResponse::AddProviderOk);
+}
+
+#[tokio::test]
 async fn withdraw_provider_stops_republish() {
     let router = SwarmRouter::new();
     let config = DhtConfig::default();

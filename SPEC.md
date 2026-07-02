@@ -156,6 +156,8 @@ A responder that cannot answer returns:
   - **`2` — invalid key** (the `target` / `content_key` was not valid 64-char hex).
   - **`3` — provider store over capacity** (an `add_provider` was rejected by the provider-store
     admission control, §6.3; the record was NOT stored).
+  - **`4` — provider identity mismatch** (an `add_provider` named a `provider_peer_id` other than
+    the authenticated caller, §6.4; the record was NOT stored).
 
   Other codes MAY be used by responders; callers MUST NOT rely on codes other than those defined
   here.
@@ -257,9 +259,11 @@ Every node keeps a local provider store, which MUST behave as:
 
 On the serving side, `handle_request_from`'s `AddProvider` arm MUST, in order:
 
-1. **Clamp** `record.expires_at` to the local TTL ceiling (§6.2) — before admission control and
+1. **Check self-announce identity** (§6.4) when the caller identity is known — reject a
+   third-party-named record before doing anything else.
+2. **Clamp** `record.expires_at` to the local TTL ceiling (§6.2) — before admission control and
    before storage.
-2. **Admit** the (now-clamped) record via `put` (this section) and check the outcome: on
+3. **Admit** the (now-clamped) record via `put` (this section) and check the outcome: on
    `RejectedOverCapacity` it MUST return the `error` envelope (§5.4, code `3` — provider store
    over capacity) instead of `add_provider_ok`, and MUST NOT fold the (rejected, unstored)
    record's provider into the routing table.
@@ -267,6 +271,28 @@ On the serving side, `handle_request_from`'s `AddProvider` arm MUST, in order:
 The implementation does not verify that it is among the `k` closest nodes to the record's key
 before accepting an `add_provider` (§14) — that remains a known limitation distinct from capacity
 admission.
+
+### 6.4 Self-announce identity check
+
+`ProviderRecord` carries **no signature** (§14): nothing on the wire cryptographically binds a
+record to the peer it names as `provider_peer_id`. Without a check, any authenticated caller could
+announce an arbitrary *third-party* `provider_peer_id` as a provider of arbitrary content at
+attacker-chosen addresses — **provider-set poisoning**: a finder would receive and attempt to dial
+a bogus provider, wasting `dig-nat` connection attempts (and, since finders bias toward
+first-returned providers, this can also skew which legitimate providers get tried).
+
+- When `handle_request_from` is given a caller identity (the common, authenticated-transport case,
+  §10.2), the responder MUST reject an `add_provider` whose `record.provider_peer_id` does not
+  equal the caller's `peer_id`, returning the `error` envelope (§5.4, code `4` — provider identity
+  mismatch) and MUST NOT store the record or fold its provider into the routing table.
+- `handle_request` (no caller identity supplied, §10.2) cannot perform this check — that path
+  already deviates from the mTLS-authenticated model and is unaffected by this rule.
+- This check is a coarse, unsigned substitute for real authenticity: it constrains announces to
+  **self-announces only** (a peer may announce itself, not vouch for others). It does not by
+  itself prevent a peer from lying about content it does not actually hold — that integrity comes
+  from the download layer's per-chunk merkle verification, not from the record (§14). A future
+  signed-record scheme (provider signs `content_key ‖ addresses ‖ expires_at`) would allow
+  authenticated third-party relaying; until then, third-party announces are simply rejected.
 
 ## 7. Routing table
 
@@ -492,13 +518,17 @@ Invariant: **no single peer failure is ever fatal to a lookup.**
   `MAX_ADDRESSES_PER_RECORD` (§5.5) — a single record/contact can never carry an unbounded address
   list, which would otherwise inflate per-record memory and, once stored, be re-served (cloned) to
   every peer that later queries for it (bandwidth amplification).
-- **Known limitations (as implemented).** Provider records are **not signed**: an authenticated
-  caller can announce a record naming a *third-party* `provider_peer_id` (the store does not
-  require `provider_peer_id == caller`). A finder gets integrity from the content itself (per-chunk
-  merkle verification in the download layer), not from the record. Responders also do not verify
-  their own closeness to the key before accepting `add_provider`. Rate limiting per-caller (as
-  opposed to the crate's own per-key/global capacity caps) is not implemented in this crate and,
-  where needed, is the embedding node's responsibility.
+- **Self-announce identity check.** When the caller identity is known, `add_provider` is rejected
+  (error code `4`) unless `record.provider_peer_id == caller.peer_id` (§6.4) — an authenticated
+  caller may announce only itself, never vouch for a third party.
+- **Known limitations (as implemented).** Provider records are **not signed**: the self-announce
+  check (§6.4) constrains WHO may be named as provider but does not cryptographically bind the
+  record to that identity, and the check cannot run at all on the `handle_request` (no-caller)
+  path. A finder gets content integrity from the content itself (per-chunk merkle verification in
+  the download layer), not from the record. Responders also do not verify their own closeness to
+  the key before accepting `add_provider`. Rate limiting per-caller (as opposed to the crate's own
+  per-key/global capacity caps) is not implemented in this crate and, where needed, is the
+  embedding node's responsibility.
 
 ## 15. Public API surface
 
@@ -550,6 +580,7 @@ framing.
 | Inbound TTL clamp | `add_provider`'s `expires_at` clamped to `min(received, now + local provider_ttl)` before storage (§6.2, §10.1) | A malicious/over-long expiry can never outlive local GC |
 | Caller identity | mTLS-authenticated, never wire-asserted (§10.2) | Routing tables cannot be poisoned by claimed ids |
 | Provider-store capacity | Per-key cap (soonest-to-expire eviction) + global cap (rejection), error code `3` on reject (§5.4, §6.3) | One peer's `add_provider` flood cannot exhaust responder memory |
+| Self-announce identity | `add_provider` rejected (error code `4`) unless `provider_peer_id == caller.peer_id`, when caller is known (§5.4, §6.4) | A caller cannot announce a third party as a content provider |
 
 Cross-repo: the wire and keyspace contracts above must match the DIG Protocol **Peer network** page
 (docs.dig.net → Protocol → Peer network, §4c and its conformance table) exactly; `dig-nat` provides
