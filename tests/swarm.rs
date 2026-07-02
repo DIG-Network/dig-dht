@@ -413,6 +413,59 @@ async fn add_provider_over_global_capacity_is_rejected_not_stored() {
 }
 
 #[tokio::test]
+async fn add_provider_with_malicious_expiry_is_clamped_to_local_ttl() {
+    // HIGH #2 (SECURITY_AUDIT_P2P.md #179): an inbound add_provider naming expires_at = u64::MAX
+    // must NOT be stored verbatim, or the record never GCs for the process lifetime. The responder
+    // MUST clamp it to `now + its own provider_ttl`.
+    let router = SwarmRouter::new();
+    let short_ttl = std::time::Duration::from_secs(60);
+    let config = DhtConfig {
+        provider_ttl: short_ttl,
+        ..Default::default()
+    };
+    let victim = make_node(&router, pid(0x11, 0), config).await;
+
+    let content = ContentId::store([0x77; 32]);
+    let malicious = dig_dht::ProviderRecord::new(
+        &content.to_key(),
+        &pid(0x22, 0),
+        addr(),
+        u64::MAX, // attacker asks for "never expires"
+    );
+    let resp = victim
+        .handle_request(DhtRequest::AddProvider { record: malicious })
+        .await;
+    assert_eq!(resp, DhtResponse::AddProviderOk);
+
+    // Read back via the wire-facing find_providers path (not a private field) — the stored record
+    // must report an expires_at bounded by now + provider_ttl, nowhere near u64::MAX.
+    let key = content.to_key();
+    let resp = victim
+        .handle_request(DhtRequest::FindProviders {
+            content_key: key.to_hex(),
+        })
+        .await;
+    let stored = match resp {
+        DhtResponse::Providers { providers, .. } => providers,
+        other => panic!("expected Providers, got {other:?}"),
+    };
+    assert_eq!(stored.len(), 1);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    assert!(
+        stored[0].expires_at <= now + short_ttl.as_secs() + 5, // small margin for test wall-clock
+        "malicious expires_at must be clamped to local TTL, got {}",
+        stored[0].expires_at
+    );
+    assert!(
+        stored[0].expires_at < u64::MAX / 2,
+        "clamp must actually bound the value, not just leave it near u64::MAX"
+    );
+}
+
+#[tokio::test]
 async fn withdraw_provider_stops_republish() {
     let router = SwarmRouter::new();
     let config = DhtConfig::default();

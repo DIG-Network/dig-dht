@@ -335,7 +335,14 @@ impl DhtService {
                 let closer = self.routing.lock().await.closest(&key);
                 DhtResponse::Providers { providers, closer }
             }
-            DhtRequest::AddProvider { record } => {
+            DhtRequest::AddProvider { mut record } => {
+                // Clamp the inbound expires_at to our own TTL ceiling BEFORE admission/storage
+                // (SPEC §6.2, §14): an inbound record is never trusted to self-report its expiry.
+                // Without this, a record naming expires_at = u64::MAX would never GC (is_expired
+                // is `now >= expires_at`), making the memory it occupies permanent.
+                let clamp_ceiling = now_secs().saturating_add(self.config.provider_ttl_secs());
+                record.expires_at = record.expires_at.min(clamp_ceiling);
+
                 // Admission-controlled: put() enforces the per-key + global caps (SPEC §6.3, §14)
                 // so a flood of add_provider from one peer cannot grow the store without bound.
                 match self.providers.lock().await.put(record.clone()) {

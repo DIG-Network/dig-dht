@@ -207,6 +207,13 @@ reachable at `addresses`, until `expires_at`.* It is **soft state**, not a perma
 - Reads MUST never return expired records; garbage collection (§9.4) drops them.
 - An announcing node sets `expires_at = now + provider_ttl` (saturating addition) and republishes
   before the TTL elapses (§9.3), so a provider that goes offline ages out automatically.
+- **Inbound clamp (wire contract).** A responder handling `add_provider` MUST NOT trust the
+  record's `expires_at` as received: before admission (§6.3) it MUST clamp it to
+  `min(record.expires_at, now + local provider_ttl)`. Without this clamp, a record naming
+  `expires_at = u64::MAX` (or any value far beyond the responder's own TTL horizon) would never
+  satisfy `now >= expires_at` and so would never be reclaimed by GC (§9.4) for the life of the
+  process. The clamp bounds every third-party record to the responder's own TTL horizon
+  regardless of what the announcer claims.
 
 ### 6.3 Provider store (per-node local state)
 
@@ -235,10 +242,14 @@ Every node keeps a local provider store, which MUST behave as:
 - The store also tracks the set of content keys **this node itself announces** (its republish
   work list). Marking is idempotent; unmarking returns whether the key was being announced.
 
-On the serving side, `handle_request_from`'s `AddProvider` arm MUST check the `put` outcome: on
-`RejectedOverCapacity` it MUST return the `error` envelope (§5.4, code `3` — provider store over
-capacity) instead of `add_provider_ok`, and MUST NOT fold the (rejected, unstored) record's
-provider into the routing table.
+On the serving side, `handle_request_from`'s `AddProvider` arm MUST, in order:
+
+1. **Clamp** `record.expires_at` to the local TTL ceiling (§6.2) — before admission control and
+   before storage.
+2. **Admit** the (now-clamped) record via `put` (this section) and check the outcome: on
+   `RejectedOverCapacity` it MUST return the `error` envelope (§5.4, code `3` — provider store
+   over capacity) instead of `add_provider_ok`, and MUST NOT fold the (rejected, unstored)
+   record's provider into the routing table.
 
 The implementation does not verify that it is among the `k` closest nodes to the record's key
 before accepting an `add_provider` (§14) — that remains a known limitation distinct from capacity
@@ -456,6 +467,10 @@ Invariant: **no single peer failure is ever fatal to a lookup.**
 - **Bounded provider store.** `add_provider` is admission-controlled (§6.3): a per-key cap
   (soonest-to-expire eviction) and a global cap (rejection) bound the memory a single peer's
   `add_provider` traffic can consume, independent of any rate limiting the embedding node may add.
+- **TTL clamp.** An inbound `expires_at` is never trusted as received: it is clamped to the
+  responder's own TTL horizon (§6.2) before storage, so a malicious record can never outlive local
+  GC indefinitely — combined with the bounded store above, this makes the worst case from a
+  misbehaving peer bounded and self-healing, not permanent.
 - **Known limitations (as implemented).** Provider records are **not signed**: an authenticated
   caller can announce a record naming a *third-party* `provider_peer_id` (the store does not
   require `provider_peer_id == caller`). A finder gets integrity from the content itself (per-chunk
@@ -510,6 +525,7 @@ framing.
 | Address ordering | IPv6-first, then by `kind` rank (real `IpAddr` parse, not string heuristic) (§5.5) | Dialers try IPv6 before IPv4, per the ecosystem IPv6-first/IPv4-fallback rule |
 | Hex case | Lowercase 64-hex identifiers on the wire (§5.6) | Records remain findable |
 | Provider TTL | Absolute `expires_at` Unix seconds; expired at `now >= expires_at`; republish < TTL (§6.2, §12) | Stale providers age out uniformly |
+| Inbound TTL clamp | `add_provider`'s `expires_at` clamped to `min(received, now + local provider_ttl)` before storage (§6.2, §10.1) | A malicious/over-long expiry can never outlive local GC |
 | Caller identity | mTLS-authenticated, never wire-asserted (§10.2) | Routing tables cannot be poisoned by claimed ids |
 | Provider-store capacity | Per-key cap (soonest-to-expire eviction) + global cap (rejection), error code `3` on reject (§5.4, §6.3) | One peer's `add_provider` flood cannot exhaust responder memory |
 
