@@ -172,8 +172,14 @@ impl DhtService {
         let result = self.run_lookup(target, seeds, true).await;
         self.absorb_contacts(&result.closest).await;
 
-        // Merge local + discovered, dedup by provider, drop expired.
-        local.extend(result.providers);
+        // Merge local + discovered, dedup by provider, drop expired. Discovered records come
+        // straight off the wire from other peers' responses, bypassing `ProviderRecord::new`'s
+        // address cap — capped here before handing them back to our caller (SPEC §5.5, §14).
+        let mut discovered = result.providers;
+        for r in &mut discovered {
+            crate::record::sort_and_cap_addresses(&mut r.addresses);
+        }
+        local.extend(discovered);
         let now = now_secs();
         let mut seen = std::collections::HashSet::new();
         local.retain(|r| !r.is_expired(now) && seen.insert(r.provider_peer_id.clone()));
@@ -306,8 +312,13 @@ impl DhtService {
         request: DhtRequest,
     ) -> DhtResponse {
         // Learn the (authenticated) caller — every inbound RPC is evidence the caller is alive.
-        if let Some(c) = caller {
+        // Cap its address list at the boundary (SPEC §5.5, §14): a `Contact` decoded off the wire
+        // bypasses `Contact::new`'s cap entirely (its fields are public), so an uncapped caller
+        // address list would otherwise be folded straight into our routing table and later re-served
+        // to every peer that queries us.
+        if let Some(mut c) = caller {
             if c.peer_id != self.local_id.to_hex() {
+                crate::record::sort_and_cap_addresses(&mut c.addresses);
                 let _ = self.routing.lock().await.insert(c);
             }
         }
@@ -336,6 +347,13 @@ impl DhtService {
                 DhtResponse::Providers { providers, closer }
             }
             DhtRequest::AddProvider { mut record } => {
+                // Cap the address list at the boundary BEFORE anything else (SPEC §5.5, §14): a
+                // `ProviderRecord` decoded off the wire bypasses `ProviderRecord::new`'s cap (its
+                // fields are public), so an attacker could otherwise pack thousands of addresses into
+                // one record within the 256 KiB frame limit — stored, folded into routing, and
+                // re-served (cloned) to every querying peer.
+                crate::record::sort_and_cap_addresses(&mut record.addresses);
+
                 // Clamp the inbound expires_at to our own TTL ceiling BEFORE admission/storage
                 // (SPEC §6.2, §14): an inbound record is never trusted to self-report its expiry.
                 // Without this, a record naming expires_at = u64::MAX would never GC (is_expired
@@ -426,10 +444,16 @@ impl DhtService {
     /// Fold discovered contacts back into the routing table (skipping ourselves). Applies the LRS
     /// insert policy; a full bucket's [`InsertOutcome::Full`] is left for the ping-and-replace
     /// maintenance (we do not ping inline to keep lookups fast).
+    ///
+    /// `contacts` come straight off the wire (a peer's `find_node`/`find_providers` response) and
+    /// so bypass [`Contact::new`]'s address cap (its fields are public) — this is another
+    /// untrusted-input boundary (SPEC §5.5, §14), capped here before insertion.
     async fn absorb_contacts(&self, contacts: &[Contact]) {
         let mut rt = self.routing.lock().await;
         for c in contacts {
-            match rt.insert(c.clone()) {
+            let mut c = c.clone();
+            crate::record::sort_and_cap_addresses(&mut c.addresses);
+            match rt.insert(c) {
                 InsertOutcome::Inserted => {}
                 InsertOutcome::Full { .. } => {
                     // Bucket full — leave for ping-and-replace; do not block the lookup on a ping.

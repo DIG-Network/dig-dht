@@ -108,6 +108,30 @@ pub(crate) fn sort_addresses_ipv6_first(addresses: &mut [CandidateAddr]) {
     addresses.sort_by_key(CandidateAddr::family_then_kind_rank);
 }
 
+/// Maximum [`CandidateAddr`] entries kept per [`ProviderRecord`] / [`crate::routing::Contact`].
+///
+/// A record/contact carries candidate addresses so a finder can dial the holder; nothing on the
+/// wire or decode path previously bounded how many a single record could carry (only the overall
+/// 256 KiB frame did — [`crate::wire::MAX_FRAMED_BODY`]), so one frame could smuggle thousands of
+/// addresses that the victim would store, fold into its routing table, AND re-serve (cloned) to
+/// every querying peer — memory inflation plus bandwidth amplification (SPEC §5.5, §14). Eight is
+/// generous headroom over the four [`AddressKind`] variants (a conforming producer emits at most
+/// one address per kind per family) while remaining a small, cheap-to-clone constant.
+pub const MAX_ADDRESSES_PER_RECORD: usize = 8;
+
+/// Sort `addresses` **IPv6-first-then-rank** (see [`sort_addresses_ipv6_first`]) and then truncate
+/// to [`MAX_ADDRESSES_PER_RECORD`], so the most-preferred candidates are the ones kept when a list
+/// exceeds the cap. This is the one admission point both the constructors ([`ProviderRecord::new`],
+/// [`crate::routing::Contact::new`]) and the wire-decode boundary (`handle_request_from`'s
+/// `AddProvider` arm, and contacts folded in from lookup responses) MUST call before accepting an
+/// address list from any source that did not already go through it — a `ProviderRecord` /
+/// `Contact` deserialized directly from the wire bypasses the constructors entirely (their fields
+/// are public), so capping only in `new` would not close the untrusted-input path.
+pub(crate) fn sort_and_cap_addresses(addresses: &mut Vec<CandidateAddr>) {
+    sort_addresses_ipv6_first(addresses);
+    addresses.truncate(MAX_ADDRESSES_PER_RECORD);
+}
+
 /// The DHT's stored value: peer `provider_peer_id` holds the content whose key is `content_key`,
 /// reachable at `addresses`, until `expires_at`.
 ///
@@ -143,7 +167,7 @@ impl ProviderRecord {
         mut addresses: Vec<CandidateAddr>,
         expires_at: u64,
     ) -> Self {
-        sort_addresses_ipv6_first(&mut addresses);
+        sort_and_cap_addresses(&mut addresses);
         ProviderRecord {
             content_key: content_key.to_hex(),
             provider_peer_id: provider.to_hex(),
@@ -303,5 +327,43 @@ mod tests {
             10,
         );
         assert_eq!(rec.best_address().unwrap().host, "2001:db8::1");
+    }
+
+    // ---- Address-list cap (MEDIUM: no cap on addresses[], SECURITY_AUDIT_P2P.md #179) ----
+
+    #[test]
+    fn provider_record_new_caps_addresses_at_the_constant() {
+        // Feed far more than the cap — a hostile/misconfigured caller must never make a
+        // constructed record carry an unbounded address list.
+        let key = Key::from_bytes([0u8; 32]);
+        let many: Vec<CandidateAddr> = (0..1000)
+            .map(|i| CandidateAddr::direct(format!("203.0.113.{}", i % 255), 9444))
+            .collect();
+        let rec = ProviderRecord::new(&key, &pid(1), many, 10);
+        assert_eq!(rec.addresses.len(), MAX_ADDRESSES_PER_RECORD);
+    }
+
+    #[test]
+    fn provider_record_new_cap_keeps_most_preferred_after_sort() {
+        // The cap must apply AFTER the IPv6-first-then-rank sort, so truncation drops the LEAST
+        // preferred candidates, not an arbitrary prefix of the input order.
+        let key = Key::from_bytes([0u8; 32]);
+        let mut addrs: Vec<CandidateAddr> = Vec::new();
+        // One preferred IPv6 direct address that must survive the cap...
+        addrs.push(CandidateAddr::direct("2001:db8::1", 9444));
+        // ...buried behind far more than the cap worth of low-preference IPv4 relay markers.
+        for i in 0..1000u32 {
+            addrs.push(CandidateAddr {
+                host: format!("198.51.100.{}", i % 255),
+                port: 1,
+                kind: AddressKind::Relay,
+            });
+        }
+        let rec = ProviderRecord::new(&key, &pid(1), addrs, 10);
+        assert_eq!(rec.addresses.len(), MAX_ADDRESSES_PER_RECORD);
+        assert_eq!(
+            rec.addresses[0].host, "2001:db8::1",
+            "the single most-preferred (IPv6 direct) candidate must survive truncation"
+        );
     }
 }

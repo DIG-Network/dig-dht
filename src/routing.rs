@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use dig_nat::PeerId;
 
 use crate::key::Key;
-use crate::record::{sort_addresses_ipv6_first, CandidateAddr};
+use crate::record::{sort_and_cap_addresses, CandidateAddr};
 
 /// A known peer in the routing table / on the wire: its `peer_id` (64-hex) and candidate addresses.
 ///
@@ -40,7 +40,7 @@ impl Contact {
     /// IPv6-first-then-rank (see `sort_addresses_ipv6_first`) — ecosystem-wide IPv6-first,
     /// IPv4-fallback for peer communication.
     pub fn new(peer_id: &PeerId, mut addresses: Vec<CandidateAddr>) -> Self {
-        sort_addresses_ipv6_first(&mut addresses);
+        sort_and_cap_addresses(&mut addresses);
         Contact {
             peer_id: peer_id.to_hex(),
             addresses,
@@ -485,5 +485,16 @@ mod tests {
             ],
         );
         assert_eq!(c.best_address().unwrap().host, "2001:db8::1");
+    }
+
+    #[test]
+    fn contact_new_caps_addresses_at_the_constant() {
+        // MEDIUM (SECURITY_AUDIT_P2P.md #179): a contact must never carry an unbounded address
+        // list — memory blowup + outbound amplification when re-served to every querying peer.
+        let many: Vec<CandidateAddr> = (0..1000)
+            .map(|i| CandidateAddr::direct(format!("203.0.113.{}", i % 255), 9444))
+            .collect();
+        let c = Contact::new(&pid([1u8; 32]), many);
+        assert_eq!(c.addresses.len(), crate::record::MAX_ADDRESSES_PER_RECORD);
     }
 }

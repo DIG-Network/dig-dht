@@ -466,6 +466,50 @@ async fn add_provider_with_malicious_expiry_is_clamped_to_local_ttl() {
 }
 
 #[tokio::test]
+async fn add_provider_with_unbounded_addresses_is_capped_at_the_boundary() {
+    // MEDIUM (SECURITY_AUDIT_P2P.md #179): a ProviderRecord built directly (as a wire decode
+    // would, bypassing ProviderRecord::new's own cap since its fields are public) with thousands
+    // of addresses must still be capped by the responder before storage.
+    let router = SwarmRouter::new();
+    let config = DhtConfig::default();
+    let victim = make_node(&router, pid(0x13, 0), config).await;
+
+    let content = ContentId::store([0x88; 32]);
+    let flood: Vec<CandidateAddr> = (0..2000)
+        .map(|i| CandidateAddr::direct(format!("203.0.113.{}", i % 255), 9444))
+        .collect();
+    // Constructed as a raw struct literal — exactly what a `serde_json::from_slice` wire decode
+    // would produce, bypassing `ProviderRecord::new`.
+    let malicious = dig_dht::ProviderRecord {
+        content_key: content.to_key().to_hex(),
+        provider_peer_id: pid(0x24, 0).to_hex(),
+        addresses: flood,
+        expires_at: u64::MAX,
+    };
+    let resp = victim
+        .handle_request(DhtRequest::AddProvider { record: malicious })
+        .await;
+    assert_eq!(resp, DhtResponse::AddProviderOk);
+
+    let key = content.to_key();
+    let resp = victim
+        .handle_request(DhtRequest::FindProviders {
+            content_key: key.to_hex(),
+        })
+        .await;
+    let stored = match resp {
+        DhtResponse::Providers { providers, .. } => providers,
+        other => panic!("expected Providers, got {other:?}"),
+    };
+    assert_eq!(stored.len(), 1);
+    assert_eq!(
+        stored[0].addresses.len(),
+        dig_dht::record::MAX_ADDRESSES_PER_RECORD,
+        "stored record's address list must be capped, not the raw flood"
+    );
+}
+
+#[tokio::test]
 async fn withdraw_provider_stops_republish() {
     let router = SwarmRouter::new();
     let config = DhtConfig::default();

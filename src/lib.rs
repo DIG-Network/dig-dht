@@ -59,7 +59,7 @@ pub use config::DhtConfig;
 pub use content::ContentId;
 pub use error::DhtError;
 pub use key::{Distance, Key};
-pub use record::{AddressKind, CandidateAddr, ProviderRecord};
+pub use record::{AddressKind, CandidateAddr, ProviderRecord, MAX_ADDRESSES_PER_RECORD};
 pub use routing::{Contact, RoutingTable};
 pub use service::{BootstrapPeer, DhtService};
 pub use transport::DhtTransport;

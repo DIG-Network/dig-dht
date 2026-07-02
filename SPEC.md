@@ -185,6 +185,19 @@ ProviderRecord = { "content_key":"<64hex>", "provider_peer_id":"<64hex>",
   itself. A bare `relay` marker (`host:""`, `port:0`) is not directly dialable and sorts as
   IPv4/hostname (its empty `host` does not parse as IPv6). This ordering is additive: it does not
   change the `CandidateAddr` field names, types, or JSON encoding — only the list order.
+- **Address-list cap is a receive-side limit, NOT a wire encoding change.** `addresses[]` carries
+  no length prefix or bound of its own on the wire beyond the overall `MAX_FRAMED_BODY` frame
+  (§5.2); an implementation MUST NOT reject or mis-decode a message because it carries more than
+  `MAX_ADDRESSES_PER_RECORD` (**8**) addresses — the JSON shape and field shapes are unaffected and
+  a conforming decoder MUST successfully parse a longer list. Instead, every point that admits an
+  address list into local state (or hands one back to a caller) MUST sort it IPv6-first-then-rank
+  (above) and then **truncate to `MAX_ADDRESSES_PER_RECORD`**, so the most-preferred candidates are
+  the ones retained: [`ProviderRecord::new`], [`Contact::new`], the responder's `add_provider`
+  handling (both the record's own `addresses` and the authenticated caller's `Contact`, §10.2),
+  contacts absorbed from a lookup's `closer`/`nodes` results, and provider records returned to a
+  `find_providers` caller. This bounds per-record memory and the amplification of re-serving a
+  received list to other peers without changing what a conforming peer may transmit or how a
+  receiver decodes it.
 
 ### 5.6 Hex-case requirement
 
@@ -471,6 +484,11 @@ Invariant: **no single peer failure is ever fatal to a lookup.**
   responder's own TTL horizon (§6.2) before storage, so a malicious record can never outlive local
   GC indefinitely — combined with the bounded store above, this makes the worst case from a
   misbehaving peer bounded and self-healing, not permanent.
+- **Address-list cap.** Every `addresses[]` admitted into local state (a stored `ProviderRecord`,
+  a routing-table `Contact`, or a `find_providers` result handed back to a caller) is capped at
+  `MAX_ADDRESSES_PER_RECORD` (§5.5) — a single record/contact can never carry an unbounded address
+  list, which would otherwise inflate per-record memory and, once stored, be re-served (cloned) to
+  every peer that later queries for it (bandwidth amplification).
 - **Known limitations (as implemented).** Provider records are **not signed**: an authenticated
   caller can announce a record naming a *third-party* `provider_peer_id` (the store does not
   require `provider_peer_id == caller`). A finder gets integrity from the content itself (per-chunk
@@ -490,10 +508,10 @@ Exported from the crate root (`#![forbid(unsafe_code)]`, MSRV **1.75.0**, licens
   `refresh_buckets()`, `gc()`, `ping(&Contact)`, `handle_request(DhtRequest)`,
   `handle_request_from(Option<Contact>, DhtRequest)`, `known_closest(&Key)`, `routing_len()`.
 - `DhtConfig` (§12), `ContentId` (§3–4), `Key` / `Distance` (§2), `ProviderRecord` /
-  `CandidateAddr` / `AddressKind` (§5.5, §6), `Contact` / `RoutingTable` (§7), `BootstrapPeer`
-  (§9.1), `DhtTransport` (§11), `DhtRequest` / `DhtResponse` + `MAX_FRAMED_BODY` (§5),
-  `DhtError` (§13), and the re-exported `dig_nat::PeerId` (one peer-identity type across the
-  transport and the DHT).
+  `CandidateAddr` / `AddressKind` / `MAX_ADDRESSES_PER_RECORD` (§5.5, §6), `Contact` /
+  `RoutingTable` (§7), `BootstrapPeer` (§9.1), `DhtTransport` (§11), `DhtRequest` / `DhtResponse` +
+  `MAX_FRAMED_BODY` (§5), `DhtError` (§13), and the re-exported `dig_nat::PeerId` (one
+  peer-identity type across the transport and the DHT).
 - `lookup::iterative_find` (§8) and `provider_store::ProviderStore` /
   `provider_store::ProviderStoreLimits` / `provider_store::PutOutcome` (§6.3) are public modules
   usable directly.
@@ -523,6 +541,7 @@ framing.
 | `find_providers` response | ALWAYS carries `closer` (§5.3) | Iterative lookups converge |
 | Address shape | `{host, port, kind}` with lowercase `kind` tokens, byte-compatible with L7 `dig.getPeers` (§5.5) | Results drop into dial targets |
 | Address ordering | IPv6-first, then by `kind` rank (real `IpAddr` parse, not string heuristic) (§5.5) | Dialers try IPv6 before IPv4, per the ecosystem IPv6-first/IPv4-fallback rule |
+| Address-list cap | `MAX_ADDRESSES_PER_RECORD` = 8, receive-side truncation post-sort, not a wire/decode limit (§5.5) | No record/contact can carry an unbounded address list; wire encoding is unaffected |
 | Hex case | Lowercase 64-hex identifiers on the wire (§5.6) | Records remain findable |
 | Provider TTL | Absolute `expires_at` Unix seconds; expired at `now >= expires_at`; republish < TTL (§6.2, §12) | Stale providers age out uniformly |
 | Inbound TTL clamp | `add_provider`'s `expires_at` clamped to `min(received, now + local provider_ttl)` before storage (§6.2, §10.1) | A malicious/over-long expiry can never outlive local GC |
