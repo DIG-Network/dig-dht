@@ -306,9 +306,12 @@ and `α`:
 
 1. **Seed** a shortlist with the closest contacts already known (dedup by `peer_id`; contacts with
    malformed peer ids are skipped), sorted by XOR distance to the target.
-2. Each round, query the **`α` closest un-queried, non-failed** shortlist entries. (The reference
-   implementation awaits the batch's RPCs sequentially within a round; parallelism up to `α` per
-   round is permitted.)
+2. Each round, query the **`α` closest un-queried, non-failed** shortlist entries **concurrently**
+   — implementations MUST issue all `α` RPCs of a round in flight at once (e.g. one task per peer)
+   rather than awaiting them one at a time, so a round of `α` peers that each stall to the
+   transport timeout costs about one `rpc_timeout`, not `α × rpc_timeout`. The reference
+   implementation spawns each peer's query as its own task and joins the round's results as they
+   arrive.
 3. Fold each response in: collected provider records are deduplicated **by provider `peer_id`**
    (first record per provider wins); returned `closer`/`nodes` contacts merge into the shortlist.
 4. Re-sort the shortlist by distance and **cap** it at `max(3·k, k + 2·α)` entries to bound memory.

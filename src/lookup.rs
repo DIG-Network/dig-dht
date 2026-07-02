@@ -18,6 +18,11 @@
 //! what each query returns differs. Transport failures to individual peers are non-fatal — a peer
 //! that errors is simply marked queried and the walk continues (the service's query closure maps a
 //! transport error to `Err(())`).
+//!
+//! Each round's `α`-sized batch is queried **truly concurrently**: every peer's RPC is
+//! [`tokio::spawn`]ed as its own task, so all `α` requests are in flight at once rather than
+//! awaited one at a time. A round of `α` peers that each stall to the transport timeout therefore
+//! costs about one `rpc_timeout`, not `α × rpc_timeout`.
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
@@ -65,7 +70,8 @@ struct ShortlistEntry {
 /// the first holders fast, not the exhaustive `k`-closest walk).
 ///
 /// The `query` closure is cloned per peer, so it must be `Clone` (the service passes an `Arc`-backed
-/// closure over the transport).
+/// closure over the transport). It must also be `Send + 'static` (and its future `Send + 'static`)
+/// because each peer's query is [`tokio::spawn`]ed to run the round's `α`-sized batch concurrently.
 pub async fn iterative_find<F, Fut>(
     target: Key,
     seeds: Vec<Contact>,
@@ -75,8 +81,8 @@ pub async fn iterative_find<F, Fut>(
     query: F,
 ) -> LookupResult
 where
-    F: Fn(Contact) -> Fut + Clone,
-    Fut: Future<Output = Result<QueryOutcome, ()>>,
+    F: Fn(Contact) -> Fut + Clone + Send + 'static,
+    Fut: Future<Output = Result<QueryOutcome, ()>> + Send + 'static,
 {
     let mut shortlist: Vec<ShortlistEntry> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
@@ -102,14 +108,30 @@ where
             break; // nothing left to ask → converged
         }
 
-        // Query the batch concurrently.
-        let mut futs = Vec::with_capacity(batch.len());
+        // Query the batch CONCURRENTLY: spawn each peer's RPC as its own task so all `alpha`
+        // requests are in flight at once, instead of awaiting them one at a time (which would cost
+        // up to alpha * rpc_timeout when peers stall — SECURITY_AUDIT_P2P.md #179).
+        let mut set = tokio::task::JoinSet::new();
         for c in &batch {
             let q = query.clone();
             let c2 = c.clone();
-            futs.push(async move { (c2.peer_id.clone(), q(c.clone()).await) });
+            set.spawn(async move { (c2.peer_id.clone(), q(c2).await) });
         }
-        let results = join_all(futs).await;
+        let mut results = Vec::with_capacity(batch.len());
+        while let Some(joined) = set.join_next().await {
+            match joined {
+                Ok(pair) => results.push(pair),
+                Err(_join_err) => {
+                    // A spawned query task panicked or was cancelled. We don't know which peer_id
+                    // it was (the JoinError doesn't carry our closure's captured id), so it cannot
+                    // be marked queried/failed individually; the lookup still terminates because
+                    // the batch-empty / converged checks below do not depend on every task
+                    // succeeding, and a peer that never reports back simply stays eligible to be
+                    // re-picked in the extremely unlikely event this happens (task panics are not
+                    // expected from the query closure's Result-returning contract).
+                }
+            }
+        }
 
         // Fold results back in.
         for (peer_id, res) in results {
@@ -192,19 +214,6 @@ fn sort_and_cap(shortlist: &mut Vec<ShortlistEntry>, k: usize, alpha: usize) {
     if shortlist.len() > cap {
         shortlist.truncate(cap);
     }
-}
-
-/// A tiny `join_all` so the crate does not pull `futures` just for this — awaits each future in turn.
-/// The futures run concurrently only if the runtime is multi-threaded and they are spawned; here we
-/// await sequentially within a round, which is fine for a bounded `α`-sized batch and keeps the
-/// dependency surface minimal. (Real network parallelism comes from `α` being small and RPCs being
-/// independent; a future optimization can spawn them.)
-async fn join_all<T>(futs: Vec<impl Future<Output = T>>) -> Vec<T> {
-    let mut out = Vec::with_capacity(futs.len());
-    for f in futs {
-        out.push(f.await);
-    }
-    out
 }
 
 #[cfg(test)]
@@ -353,5 +362,38 @@ mod tests {
         })
         .await;
         assert_eq!(result.providers.len(), 1);
+    }
+
+    // ---- Concurrency (MEDIUM/optimization: join_all awaits sequentially, SECURITY_AUDIT_P2P.md #179) ----
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn alpha_batch_is_queried_concurrently_not_sequentially() {
+        // Seed exactly `alpha` peers who each "stall" for DELAY, and never return closer contacts
+        // (so the walk needs exactly one round). If the batch is awaited sequentially, wall clock
+        // is ~alpha * DELAY; if concurrent, it is ~1 * DELAY. Assert well under alpha * DELAY so a
+        // regression back to sequential awaiting fails this test.
+        const ALPHA: usize = 4;
+        const DELAY: std::time::Duration = std::time::Duration::from_millis(150);
+
+        let target = Key::from_bytes([0u8; 32]);
+        let seeds: Vec<Contact> = (1u8..=ALPHA as u8)
+            .map(|i| contact_from_key([i; 32]))
+            .collect();
+
+        let start = std::time::Instant::now();
+        let result = iterative_find(target, seeds, 20, ALPHA, false, |_c: Contact| async move {
+            tokio::time::sleep(DELAY).await;
+            Ok(QueryOutcome::default())
+        })
+        .await;
+        let elapsed = start.elapsed();
+
+        assert_eq!(result.closest.len(), ALPHA, "all alpha peers answered");
+        assert!(
+            elapsed < DELAY * (ALPHA as u32) / 2,
+            "batch must run concurrently: expected well under {:?} (alpha * delay), got {:?}",
+            DELAY * (ALPHA as u32),
+            elapsed
+        );
     }
 }
