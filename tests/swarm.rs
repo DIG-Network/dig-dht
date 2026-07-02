@@ -349,6 +349,70 @@ async fn refresh_buckets_runs_over_populated_buckets() {
 }
 
 #[tokio::test]
+async fn add_provider_over_global_capacity_is_rejected_not_stored() {
+    // HIGH #1 (SECURITY_AUDIT_P2P.md #179): a single peer flooding add_provider for many distinct
+    // content keys must be rejected once the responder's global provider-store ceiling is hit,
+    // rather than accepted unconditionally (unbounded growth / OOM).
+    let router = SwarmRouter::new();
+    let config = DhtConfig {
+        provider_store_limits: dig_dht::provider_store::ProviderStoreLimits {
+            max_providers_per_key: 20,
+            max_total_records: 2,
+        },
+        ..Default::default()
+    };
+    let victim = make_node(&router, pid(0x10, 0), config).await;
+
+    let mk_record = |tag: u8| {
+        dig_dht::ProviderRecord::new(
+            &dig_dht::ContentId::store([tag; 32]).to_key(),
+            &pid(0x20, tag),
+            addr(),
+            u64::MAX,
+        )
+    };
+
+    // First two distinct-key announces are accepted (under the cap).
+    let ok1 = victim
+        .handle_request(DhtRequest::AddProvider {
+            record: mk_record(1),
+        })
+        .await;
+    assert_eq!(ok1, DhtResponse::AddProviderOk);
+    let ok2 = victim
+        .handle_request(DhtRequest::AddProvider {
+            record: mk_record(2),
+        })
+        .await;
+    assert_eq!(ok2, DhtResponse::AddProviderOk);
+
+    // Third distinct key exceeds the global ceiling → rejected, not stored.
+    let rejected = victim
+        .handle_request(DhtRequest::AddProvider {
+            record: mk_record(3),
+        })
+        .await;
+    match rejected {
+        DhtResponse::Error { .. } => {}
+        other => panic!("expected an over-capacity Error response, got {other:?}"),
+    }
+
+    // Confirm the rejected record was never actually stored.
+    let key3 = dig_dht::ContentId::store([3u8; 32]).to_key();
+    let resp = victim
+        .handle_request(DhtRequest::FindProviders {
+            content_key: key3.to_hex(),
+        })
+        .await;
+    match resp {
+        DhtResponse::Providers { providers, .. } => {
+            assert!(providers.is_empty(), "rejected record must not be stored")
+        }
+        other => panic!("expected Providers, got {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn withdraw_provider_stops_republish() {
     let router = SwarmRouter::new();
     let config = DhtConfig::default();

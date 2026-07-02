@@ -1,7 +1,9 @@
 //! [`DhtConfig`] — the Kademlia tuning parameters (replication `k`, lookup parallelism `α`, provider
-//! TTL, and the maintenance intervals).
+//! TTL, the maintenance intervals, and the provider-store admission-control caps).
 
 use std::time::Duration;
+
+use crate::provider_store::ProviderStoreLimits;
 
 /// Kademlia parameters for a [`DhtService`](crate::DhtService).
 ///
@@ -20,6 +22,10 @@ pub struct DhtConfig {
 
     /// **Provider-record TTL** — how long a PUT provider record is considered valid. A holder
     /// republishes before this elapses; a finder discards records older than this. Default: 2 hours.
+    ///
+    /// This is also the **clamp ceiling** for inbound `add_provider` records (SPEC §6.2, §14): a
+    /// responder never stores a third-party `expires_at` further in the future than
+    /// `now + provider_ttl`, so a malicious record can never outlive local GC indefinitely.
     pub provider_ttl: Duration,
 
     /// **Republish interval** — how often the holder re-announces the content it still holds, so its
@@ -34,6 +40,12 @@ pub struct DhtConfig {
     /// **Per-RPC timeout** — how long a single request to one peer may take before that peer is
     /// treated as unresponsive and the lookup moves on. Default: 5 seconds.
     pub rpc_timeout: Duration,
+
+    /// **Provider-store admission-control caps** — the per-content-key and global record limits
+    /// enforced on every inbound `add_provider` (SPEC §6.3, §14). Bounds worst-case memory growth
+    /// from a single peer (or a small set of colluding peers) flooding announces. Default:
+    /// [`ProviderStoreLimits::default`].
+    pub provider_store_limits: ProviderStoreLimits,
 }
 
 impl Default for DhtConfig {
@@ -45,6 +57,7 @@ impl Default for DhtConfig {
             republish_interval: Duration::from_secs(60 * 60),
             refresh_interval: Duration::from_secs(60 * 60),
             rpc_timeout: Duration::from_secs(5),
+            provider_store_limits: ProviderStoreLimits::default(),
         }
     }
 }
@@ -73,5 +86,14 @@ mod tests {
         // Invariant: a record must be republished before it expires, or providers vanish while online.
         let c = DhtConfig::default();
         assert!(c.republish_interval < c.provider_ttl);
+    }
+
+    #[test]
+    fn default_provider_store_limits_are_bounded() {
+        // The audit's "unbounded provider store" finding: the default config MUST carry a non-zero,
+        // finite cap so a freshly constructed DhtService is never unbounded out of the box.
+        let c = DhtConfig::default();
+        assert!(c.provider_store_limits.max_providers_per_key > 0);
+        assert!(c.provider_store_limits.max_total_records > 0);
     }
 }

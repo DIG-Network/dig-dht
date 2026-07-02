@@ -152,7 +152,11 @@ A responder that cannot answer returns:
 
 - The error envelope is **advisory**: a lookup treats a peer that returns it exactly like an
   unreachable peer and walks on. It is never fatal to a lookup.
-- Defined code: **`2` — invalid key** (the `target` / `content_key` was not valid 64-char hex).
+- Defined codes:
+  - **`2` — invalid key** (the `target` / `content_key` was not valid 64-char hex).
+  - **`3` — provider store over capacity** (an `add_provider` was rejected by the provider-store
+    admission control, §6.3; the record was NOT stored).
+
   Other codes MAY be used by responders; callers MUST NOT rely on codes other than those defined
   here.
 
@@ -210,15 +214,35 @@ Every node keeps a local provider store, which MUST behave as:
 
 - **Keyed by `content_key` (the 64-hex string) → one record per distinct `provider_peer_id`.**
 - **Dedup-on-provider:** a second record from the same provider for the same key REPLACES the
-  first (refreshing `expires_at` and `addresses`); it never accumulates duplicates.
+  first (refreshing `expires_at` and `addresses`); it never accumulates duplicates. A refresh
+  (same `content_key` + same `provider_peer_id`) MUST always succeed regardless of capacity — it
+  does not grow the store.
 - **TTL-filtered reads:** `get` returns only records live at the supplied `now`.
 - **GC:** expired records (and content keys left with no live providers) are removed; GC returns
   the number of records dropped.
+- **Bounded admission control (`put`).** A genuinely new `(content_key, provider_peer_id)` pair is
+  subject to two caps, both enforced on every `put`, not just at GC time:
+  - **Per-key cap** (`max_providers_per_key`, default **20** — equal to `k`): when a new provider
+    for a key would exceed this, the **soonest-to-expire** existing record for that key is evicted
+    to make room.
+  - **Global cap** (`max_total_records`, default **100 000**): when a new `(content_key,
+    provider_peer_id)` pair would exceed this, the `put` is **rejected**
+    (`PutOutcome::RejectedOverCapacity`) rather than stored. Rejection MUST NOT evict a
+    *different* content key's records — a single peer flooding new keys can never evict another
+    key's legitimate holders.
+  - A rejected `put` MUST leave the store byte-for-byte as it was before the call (no stray empty
+    entry for a content key that was never actually populated).
 - The store also tracks the set of content keys **this node itself announces** (its republish
   work list). Marking is idempotent; unmarking returns whether the key was being announced.
 
-The implementation stores records as received: it does not cap an inbound `expires_at` and does not
-verify that it is among the `k` closest nodes to the record's key before accepting (§14).
+On the serving side, `handle_request_from`'s `AddProvider` arm MUST check the `put` outcome: on
+`RejectedOverCapacity` it MUST return the `error` envelope (§5.4, code `3` — provider store over
+capacity) instead of `add_provider_ok`, and MUST NOT fold the (rejected, unstored) record's
+provider into the routing table.
+
+The implementation does not verify that it is among the `k` closest nodes to the record's key
+before accepting an `add_provider` (§14) — that remains a known limitation distinct from capacity
+admission.
 
 ## 7. Routing table
 
@@ -398,6 +422,8 @@ A conforming production implementation (wired by the embedding node, e.g. `dig-n
 | `republish_interval` | How often announced keys are re-PUT (MUST be `< provider_ttl`) | **1 hour** |
 | `refresh_interval` | How often populated buckets are refreshed | **1 hour** |
 | `rpc_timeout` | Per-RPC deadline (enforced by the transport, §11) | **5 seconds** |
+| `provider_store_limits.max_providers_per_key` | Per-content-key provider-record cap, soonest-to-expire evicted on overflow (§6.3) | **20** |
+| `provider_store_limits.max_total_records` | Global provider-record ceiling across all keys, new records rejected on overflow (§6.3) | **100 000** |
 
 Defaults for `k` and `α` follow the canonical Kademlia paper (Maymounkov & Mazières, 2002).
 
@@ -427,13 +453,16 @@ Invariant: **no single peer failure is ever fatal to a lookup.**
   dead, resisting table-flush attacks by newly minted ids.
 - **Soft state.** Provider records self-expire (§6.2); a withdrawn or dead provider disappears
   within one `provider_ttl` without any delete protocol.
+- **Bounded provider store.** `add_provider` is admission-controlled (§6.3): a per-key cap
+  (soonest-to-expire eviction) and a global cap (rejection) bound the memory a single peer's
+  `add_provider` traffic can consume, independent of any rate limiting the embedding node may add.
 - **Known limitations (as implemented).** Provider records are **not signed**: an authenticated
   caller can announce a record naming a *third-party* `provider_peer_id` (the store does not
   require `provider_peer_id == caller`). A finder gets integrity from the content itself (per-chunk
-  merkle verification in the download layer), not from the record. Responders also do not cap an
-  inbound `expires_at` to their own TTL and accept `add_provider` regardless of their closeness to
-  the key. Rate limiting / quota on the provider store is not implemented in this crate and, where
-  needed, is the embedding node's responsibility.
+  merkle verification in the download layer), not from the record. Responders also do not verify
+  their own closeness to the key before accepting `add_provider`. Rate limiting per-caller (as
+  opposed to the crate's own per-key/global capacity caps) is not implemented in this crate and,
+  where needed, is the embedding node's responsibility.
 
 ## 15. Public API surface
 
@@ -450,7 +479,8 @@ Exported from the crate root (`#![forbid(unsafe_code)]`, MSRV **1.75.0**, licens
   (§9.1), `DhtTransport` (§11), `DhtRequest` / `DhtResponse` + `MAX_FRAMED_BODY` (§5),
   `DhtError` (§13), and the re-exported `dig_nat::PeerId` (one peer-identity type across the
   transport and the DHT).
-- `lookup::iterative_find` (§8) and `provider_store::ProviderStore` (§6.3) are public modules
+- `lookup::iterative_find` (§8) and `provider_store::ProviderStore` /
+  `provider_store::ProviderStoreLimits` / `provider_store::PutOutcome` (§6.3) are public modules
   usable directly.
 
 Dependency posture: the crate depends on `dig-nat` for identity/transport types only — not on the
@@ -481,6 +511,7 @@ framing.
 | Hex case | Lowercase 64-hex identifiers on the wire (§5.6) | Records remain findable |
 | Provider TTL | Absolute `expires_at` Unix seconds; expired at `now >= expires_at`; republish < TTL (§6.2, §12) | Stale providers age out uniformly |
 | Caller identity | mTLS-authenticated, never wire-asserted (§10.2) | Routing tables cannot be poisoned by claimed ids |
+| Provider-store capacity | Per-key cap (soonest-to-expire eviction) + global cap (rejection), error code `3` on reject (§5.4, §6.3) | One peer's `add_provider` flood cannot exhaust responder memory |
 
 Cross-repo: the wire and keyspace contracts above must match the DIG Protocol **Peer network** page
 (docs.dig.net → Protocol → Peer network, §4c and its conformance table) exactly; `dig-nat` provides

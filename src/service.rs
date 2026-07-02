@@ -33,7 +33,7 @@ use crate::content::ContentId;
 use crate::error::DhtError;
 use crate::key::Key;
 use crate::lookup::{iterative_find, QueryOutcome};
-use crate::provider_store::ProviderStore;
+use crate::provider_store::{ProviderStore, PutOutcome};
 use crate::record::{CandidateAddr, ProviderRecord};
 use crate::routing::{Contact, InsertOutcome, RoutingTable};
 use crate::transport::DhtTransport;
@@ -87,12 +87,13 @@ impl DhtService {
         transport: Arc<dyn DhtTransport>,
     ) -> Self {
         let routing = RoutingTable::new(&local_id, config.k);
+        let providers = ProviderStore::with_limits(config.provider_store_limits);
         DhtService {
             local_id,
             local_addresses,
             config,
             routing: Arc::new(Mutex::new(routing)),
-            providers: Arc::new(Mutex::new(ProviderStore::new())),
+            providers: Arc::new(Mutex::new(providers)),
             transport,
         }
     }
@@ -335,13 +336,22 @@ impl DhtService {
                 DhtResponse::Providers { providers, closer }
             }
             DhtRequest::AddProvider { record } => {
-                // Fold the provider into our routing table (its addresses let us reach it) and store.
-                if let Some(pid) = record.provider_peer_id() {
-                    let contact = Contact::new(&pid, record.addresses.clone());
-                    let _ = self.routing.lock().await.insert(contact);
+                // Admission-controlled: put() enforces the per-key + global caps (SPEC §6.3, §14)
+                // so a flood of add_provider from one peer cannot grow the store without bound.
+                match self.providers.lock().await.put(record.clone()) {
+                    PutOutcome::Accepted => {
+                        // Fold the provider into our routing table (its addresses let us reach it).
+                        if let Some(pid) = record.provider_peer_id() {
+                            let contact = Contact::new(&pid, record.addresses.clone());
+                            let _ = self.routing.lock().await.insert(contact);
+                        }
+                        DhtResponse::AddProviderOk
+                    }
+                    PutOutcome::RejectedOverCapacity => DhtResponse::Error {
+                        code: 3,
+                        message: "provider store over capacity".into(),
+                    },
                 }
-                self.providers.lock().await.put(record);
-                DhtResponse::AddProviderOk
             }
         }
     }
