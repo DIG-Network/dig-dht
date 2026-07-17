@@ -16,7 +16,7 @@
 # in-memory transport harness (NO real network).
 [package]
 name = "dig-dht"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 rust-version = "1.75.0"
 license = "Apache-2.0 OR MIT"
@@ -30,13 +30,10 @@ categories = ["network-programming"]
 # Peer identity (peer_id = SHA-256(TLS SPKI DER)) + the mTLS transport the DHT RPC rides. The DHT
 # keys its k-buckets by dig-nat's `PeerId` and carries its RPC over dig-nat `PeerConnection` streams.
 #
-# Sourcing: like dig-nat itself, dig-nat is not yet on crates.io, so we resolve from the DIG-Network
-# git repo for both the standalone CI checkout and the superproject build. `version = "0.1"` is what
-# `cargo publish` records. RELEASE ORDERING (ecosystem rule: release-first for shared contracts):
-# dig-nat (and dig-constants 0.2.x) must be published to crates.io, and these `git` sources swapped
-# for the plain crates.io versions, BEFORE dig-dht is published — `cargo publish` rejects a git
-# dependency, so the publish workflow enforces this. The orchestrator sequences the release tags.
-dig-nat = { version = "0.1", git = "https://github.com/DIG-Network/dig-nat" }
+# Sourcing: dig-nat is published to crates.io, so we resolve the plain crates.io version (NC-7:
+# prefer the crates.io release over a bare-git source). `0.2` picks up the persistent-reservation
+# discovery additions (dig-nat 0.2.x), which are additive over the 0.1 API the DHT rides.
+dig-nat = "0.2"
 
 # Async runtime for the service task + maintenance timers + lookup fan-out.
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "sync", "io-util"] }
