@@ -493,7 +493,7 @@ dependencies = [
 
 [[package]]
 name = "dig-dht"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "async-trait",
  "dig-nat",
@@ -508,9 +508,9 @@ dependencies = [
 
 [[package]]
 name = "dig-nat"
-version = "0.2.1"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "78f63bcf33524696cddf7503794fa56df490f8a36f1a1ef359c263355bfa8675"
+checksum = "c87e5056c31a07830047611e8b95988c4c548768732834bcffe01c1f63df1690"
 dependencies = [
  "async-trait",
  "dig-constants",
