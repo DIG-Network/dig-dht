@@ -509,9 +509,9 @@ dependencies = [
 
 [[package]]
 name = "dig-ip"
-version = "0.1.0"
+version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4c27cd344c8ff2e6d86609d72c8705f7b03560507637f5566d8f78a00d8bffaa"
+checksum = "04c144a0a675a27cc8db65af861bb05db828335545e7969cf2b44e44d0458175"
 dependencies = [
  "futures",
  "tokio",
