@@ -12,8 +12,9 @@
 //! L7 peer-network `dig.getPeers` `addresses[]` shape (§7), so a record's addresses drop straight
 //! into a `PeerTarget` for [`dig_nat::connect`].
 
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 
+use dig_ip::Family;
 use serde::{Deserialize, Serialize};
 
 use dig_nat::PeerId;
@@ -82,21 +83,30 @@ impl CandidateAddr {
         }
     }
 
-    /// Whether `host` parses as a literal IPv6 address.
-    ///
-    /// Peer communication is **IPv6-first, IPv4-fallback** (ecosystem hard rule): candidate lists
-    /// are ordered so IPv6 literals sort before IPv4 literals (and before hostnames, which parse as
-    /// neither). This is a real `IpAddr` parse, not a `contains(':')` heuristic, so it is not fooled
-    /// by bracketed `[::1]` forms or other punctuation.
-    fn is_ipv6_literal(&self) -> bool {
-        matches!(self.host.parse::<IpAddr>(), Ok(IpAddr::V6(_)))
+    /// The address-family half of the sort key, derived from [`dig_ip::Family`] — the ecosystem's
+    /// single source of truth for the IPv6-first / IPv4-fallback rule (CLAUDE.md §5.2). `0` for a
+    /// genuine IPv6 literal, `1` for an IPv4 literal (including an IPv4-mapped IPv6 address, which
+    /// [`Family::of`] correctly classifies as V4 — it is IPv4 reachability) OR a hostname (which
+    /// parses as neither and falls back with IPv4). Deriving the family here, rather than
+    /// hand-rolling an `is_ipv6` check, keeps dig-dht from drifting off the canonical contract.
+    fn family_rank(&self) -> u8 {
+        let family = self
+            .host
+            .parse::<IpAddr>()
+            .ok()
+            .map(|ip| Family::of(&SocketAddr::new(ip, self.port)));
+        match family {
+            Some(Family::V6) => 0,
+            Some(Family::V4) | None => 1,
+        }
     }
 
-    /// Sort key for IPv6-first, then-by-[`AddressKind::rank`] ordering: `(family_rank, kind_rank)`
-    /// where an IPv6 literal sorts before anything else (IPv4 literal or hostname).
+    /// Sort key for IPv6-first, then most-direct-first ordering: `(family_rank, kind_rank)`. The
+    /// family half comes from [`dig_ip::Family`] (see [`family_rank`](Self::family_rank)); the
+    /// dht-specific directness tiebreak stays [`AddressKind::rank`], so within one family the most
+    /// direct candidate sorts first.
     fn family_then_kind_rank(&self) -> (u8, u8) {
-        let family_rank = u8::from(!self.is_ipv6_literal());
-        (family_rank, self.kind.rank())
+        (self.family_rank(), self.kind.rank())
     }
 }
 
@@ -311,6 +321,63 @@ mod tests {
             hosts,
             vec!["2001:db8::1", "2001:db8::2", "203.0.113.7", "198.51.100.2"],
             "addresses must be IPv6-first, then ranked by AddressKind"
+        );
+    }
+
+    #[test]
+    fn family_key_derives_from_dig_ip_family() {
+        // The FAMILY half of the sort key comes from `dig_ip::Family`, the single ecosystem source
+        // of truth — not a hand-rolled `is_ipv6` heuristic. The load-bearing proof is the
+        // IPv4-mapped IPv6 case: `dig_ip::Family::of` classifies `::ffff:a.b.c.d` as V4 (it is IPv4
+        // reachability), so it must sort with IPv4, AFTER a genuine IPv6 address of the same kind. A
+        // `host.parse::<IpAddr>()`-based family key would have (wrongly) treated it as IPv6.
+        let key = Key::from_bytes([0u8; 32]);
+        let rec = ProviderRecord::new(
+            &key,
+            &pid(1),
+            vec![
+                CandidateAddr::direct("::ffff:203.0.113.9", 9444), // IPv4-mapped → V4 per dig-ip
+                CandidateAddr::direct("2001:db8::1", 9444),        // genuine IPv6 → V6
+            ],
+            10,
+        );
+        let hosts: Vec<&str> = rec.addresses.iter().map(|a| a.host.as_str()).collect();
+        assert_eq!(
+            hosts,
+            vec!["2001:db8::1", "::ffff:203.0.113.9"],
+            "an IPv4-mapped IPv6 address must sort as V4 (dig_ip::Family), after a genuine IPv6"
+        );
+    }
+
+    #[test]
+    fn directness_kind_rank_preserved_as_tiebreak_within_a_family() {
+        // Within ONE address family the dht-specific most-direct-first `AddressKind::rank` tiebreak
+        // MUST survive the migration to dig-ip family keying: same family, different directness →
+        // Direct before Mapped before Reflexive.
+        let key = Key::from_bytes([0u8; 32]);
+        let rec = ProviderRecord::new(
+            &key,
+            &pid(1),
+            vec![
+                CandidateAddr {
+                    host: "2001:db8::3".into(),
+                    port: 1,
+                    kind: AddressKind::Reflexive,
+                },
+                CandidateAddr {
+                    host: "2001:db8::2".into(),
+                    port: 1,
+                    kind: AddressKind::Mapped,
+                },
+                CandidateAddr::direct("2001:db8::1", 9444),
+            ],
+            10,
+        );
+        let hosts: Vec<&str> = rec.addresses.iter().map(|a| a.host.as_str()).collect();
+        assert_eq!(
+            hosts,
+            vec!["2001:db8::1", "2001:db8::2", "2001:db8::3"],
+            "within one family, addresses must stay ordered by AddressKind::rank (most-direct first)"
         );
     }
 
