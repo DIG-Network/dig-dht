@@ -179,13 +179,18 @@ ProviderRecord = { "content_key":"<64hex>", "provider_peer_id":"<64hex>",
 - **Address ordering is IPv6-first, then by `kind` rank** (ecosystem-wide IPv6-first, IPv4-fallback
   rule for peer communication): [`ProviderRecord::new`] and [`Contact::new`] sort their `addresses`
   so every IPv6-literal candidate sorts before every IPv4-literal or hostname candidate, and within
-  each family candidates are ordered most-direct-first by `kind` rank. IPv6/IPv4 detection is a real
-  `IpAddr` parse of `host` (not a `contains(':')` heuristic), so bracketed and other non-literal
-  forms are classified correctly. Address order on the wire is therefore IPv6-first-then-rank as
+  each family candidates are ordered most-direct-first by `kind` rank. **The address-family half of
+  the sort key comes from the canonical `dig-ip` crate (`dig_ip::Family::of`) — the ecosystem's
+  single source of truth for the IPv6-first / IPv4-fallback family contract (CLAUDE.md §5.2)** — not
+  a hand-rolled `is_ipv6` check, so dig-dht cannot drift off the canonical rule; the dht-specific
+  most-direct-first `kind` rank remains dig-dht's own tiebreak within a family. `dig_ip::Family`
+  classifies `host` from a real `IpAddr` parse (not a `contains(':')` heuristic), and in particular
+  classifies an IPv4-mapped IPv6 literal (`::ffff:a.b.c.d`) as **IPv4** — it is IPv4 reachability, so
+  it sorts with the IPv4 family. Address order on the wire is therefore IPv6-first-then-rank as
   produced by a conforming implementation; a consumer that receives a record from a
   non-conforming/older peer MUST NOT assume the ordering and SHOULD still pick by family-then-rank
   itself. A bare `relay` marker (`host:""`, `port:0`) is not directly dialable and sorts as
-  IPv4/hostname (its empty `host` does not parse as IPv6). This ordering is additive: it does not
+  IPv4/hostname (its empty `host` does not parse as an IP). This ordering is additive: it does not
   change the `CandidateAddr` field names, types, or JSON encoding — only the list order.
 - **Address-list cap is a receive-side limit, NOT a wire encoding change.** `addresses[]` carries
   no length prefix or bound of its own on the wire beyond the overall `MAX_FRAMED_BODY` frame
@@ -573,7 +578,7 @@ framing.
 | RPC methods | `find_node` / `find_providers` / `add_provider` / `ping` + `error` envelope, snake_case `type` tags (§5.3–5.4) | Any node's DHT speaks the same wire |
 | `find_providers` response | ALWAYS carries `closer` (§5.3) | Iterative lookups converge |
 | Address shape | `{host, port, kind}` with lowercase `kind` tokens, byte-compatible with L7 `dig.getPeers` (§5.5) | Results drop into dial targets |
-| Address ordering | IPv6-first, then by `kind` rank (real `IpAddr` parse, not string heuristic) (§5.5) | Dialers try IPv6 before IPv4, per the ecosystem IPv6-first/IPv4-fallback rule |
+| Address ordering | IPv6-first (family key from canonical `dig_ip::Family`), then by `kind` rank (§5.5) | Dialers try IPv6 before IPv4, per the ecosystem IPv6-first/IPv4-fallback rule (CLAUDE.md §5.2) |
 | Address-list cap | `MAX_ADDRESSES_PER_RECORD` = 8, receive-side truncation post-sort, not a wire/decode limit (§5.5) | No record/contact can carry an unbounded address list; wire encoding is unaffected |
 | Hex case | Lowercase 64-hex identifiers on the wire (§5.6) | Records remain findable |
 | Provider TTL | Absolute `expires_at` Unix seconds; expired at `now >= expires_at`; republish < TTL (§6.2, §12) | Stale providers age out uniformly |
