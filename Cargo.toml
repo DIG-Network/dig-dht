@@ -16,7 +16,7 @@
 # in-memory transport harness (NO real network).
 [package]
 name = "dig-dht"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2021"
 rust-version = "1.75.0"
 license = "Apache-2.0 OR MIT"
@@ -31,10 +31,11 @@ categories = ["network-programming"]
 # keys its k-buckets by dig-nat's `PeerId` and carries its RPC over dig-nat `PeerConnection` streams.
 #
 # Sourcing: dig-nat is published to crates.io, so we resolve the plain crates.io version (NC-7:
-# prefer the crates.io release over a bare-git source). `0.6` picks up dig-nat's cutover to
-# dig-tls for all cert/mTLS/peer_id/BLS-binding plumbing; the DHT only rides `PeerId` (re-exported
-# unchanged from dig-tls through dig-nat), so this bump touches nothing beyond the pinned version.
-dig-nat = "0.6"
+# prefer the crates.io release over a bare-git source). `0.7` adds the full NAT ladder
+# (`connect_with_runtime`/`NatRuntime`) additively over 0.6 — the existing 3-arg `connect` and
+# `PeerId` (re-exported unchanged from dig-tls through dig-nat) are untouched, so this bump touches
+# nothing beyond the pinned version.
+dig-nat = "0.7"
 
 # Address-family (IPv6-first / IPv4-fallback) contract — the ecosystem's single source of truth for
 # `Family::of` classification (CLAUDE.md §5.2, epic #1020). The DHT derives the FAMILY half of its
