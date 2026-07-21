@@ -346,7 +346,7 @@ being advertised at once rather than after a TTL:
   **evict + retract** step; the copies previously PUT at the `k` closest peers are NOT deleted by
   this call — they age out via TTL, or sooner when the node floods the signed retract announce and
   each recipient calls `remove_provider_record`.
-- **`holders_of(content) -> Vec<peer_id>`** — a thin, address-free projection over `find_providers`
+- **`holders_of(content) -> Result<Vec<PeerId>, DhtError>`** — a thin, address-free projection over `find_providers`
   (§9.2) for callers that only need "which peers hold X". `find_providers` (which returns full
   records with candidate addresses the download layer dials) remains the PRIMARY query.
 
@@ -615,7 +615,9 @@ Exported from the crate root (`#![forbid(unsafe_code)]`, MSRV **1.75.0**, licens
   `bootstrap(&[BootstrapPeer])`, `find_node(&PeerId)`, `find_providers(&ContentId)`,
   `announce_provider(&ContentId)`, `withdraw_provider(&ContentId)`, `republish()`,
   `refresh_buckets()`, `gc()`, `ping(&Contact)`, `handle_request(DhtRequest)`,
-  `handle_request_from(Option<Contact>, DhtRequest)`, `known_closest(&Key)`, `routing_len()`.
+  `handle_request_from(Option<Contact>, DhtRequest)`, `known_closest(&Key)`, `routing_len()`,
+  `ingest_verified_provider(ProviderRecord)`, `remove_provider_record(String, PeerId)`,
+  `retract_own_provider(&ContentId)`, `holders_of(&ContentId)`.
 - `DhtConfig` (§12), `ContentId` (§3–4), `Key` / `Distance` (§2), `ProviderRecord` /
   `CandidateAddr` / `AddressKind` / `MAX_ADDRESSES_PER_RECORD` (§5.5, §6), `Contact` /
   `RoutingTable` (§7), `BootstrapPeer` (§9.1), `DhtTransport` (§11), `DhtRequest` / `DhtResponse` +
