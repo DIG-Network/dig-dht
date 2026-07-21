@@ -31,6 +31,24 @@ use crate::key::Key;
 use crate::record::ProviderRecord;
 use crate::routing::Contact;
 
+/// Absolute ceiling on the number of iterative rounds a single lookup may run (#1352). A converging
+/// Kademlia lookup needs O(log n) rounds; this bound only ever trips on a pathological/adversarial
+/// swarm where responders keep feeding an endless stream of ever-closer contacts to prevent
+/// convergence (a lookup-livelock DoS). 64 rounds is far beyond any honest convergence depth.
+pub const MAX_LOOKUP_ROUNDS: usize = 64;
+
+/// Baseline ceiling on how many provider records a single peer's response may contribute to a
+/// lookup (#1352). An honest responder returns at most its per-key cap (`max_providers_per_key`,
+/// default 20) live records; a response off the wire is untrusted and could otherwise pack an
+/// unbounded set into one frame, inflating the collected-providers map. The effective cap is the
+/// larger of this and `2·k`, so a network tuned to a large `k` is never under-bounded.
+pub const MAX_PROVIDERS_PER_RESPONSE: usize = 64;
+
+/// Baseline ceiling on how many `closer` contacts a single peer's response may contribute to a
+/// lookup (#1352). An honest responder returns at most `k`; the effective cap is the larger of this
+/// and `2·k`. Bounds the per-response merge work an adversarial peer can impose.
+pub const MAX_CLOSER_PER_RESPONSE: usize = 64;
+
 /// The outcome of querying one peer during a lookup: the closer contacts it knows, and any provider
 /// records it holds for the target (empty for a pure node lookup).
 #[derive(Debug, Default, Clone)]
@@ -89,13 +107,26 @@ where
     // Collected providers, deduped by provider peer_id.
     let mut providers: HashMap<String, ProviderRecord> = HashMap::new();
 
+    // Untrusted-response ceilings (#1352): bound how much one peer's response may contribute, so a
+    // single adversarial responder cannot inflate the collected-providers map or the per-round merge
+    // work. Scaled up for a large-`k` network so an honest responder is never truncated.
+    let max_providers_per_response = MAX_PROVIDERS_PER_RESPONSE.max(k.saturating_mul(2));
+    let max_closer_per_response = MAX_CLOSER_PER_RESPONSE.max(k.saturating_mul(2));
+
     // Seed.
     for c in seeds {
         merge_contact(&mut shortlist, &mut seen, &target, c);
     }
     sort_and_cap(&mut shortlist, k, alpha);
 
+    // Round guard (#1352): an absolute cap so an adversarial swarm feeding endless ever-closer
+    // contacts cannot livelock the lookup — it always terminates in at most `MAX_LOOKUP_ROUNDS`.
+    let mut rounds = 0;
     loop {
+        rounds += 1;
+        if rounds > MAX_LOOKUP_ROUNDS {
+            break;
+        }
         // Pick the α closest un-queried, non-failed entries.
         let batch: Vec<Contact> = shortlist
             .iter()
@@ -136,7 +167,11 @@ where
         // Fold results back in.
         for (peer_id, res) in results {
             mark_queried(&mut shortlist, &peer_id, res.is_err());
-            if let Ok(outcome) = res {
+            if let Ok(mut outcome) = res {
+                // Truncate each list to the untrusted-response ceiling (#1352) BEFORE folding, so a
+                // single peer cannot inflate the providers map or impose unbounded merge work.
+                outcome.providers.truncate(max_providers_per_response);
+                outcome.closer.truncate(max_closer_per_response);
                 for p in outcome.providers {
                     providers.entry(p.provider_peer_id.clone()).or_insert(p);
                 }
@@ -362,6 +397,72 @@ mod tests {
         })
         .await;
         assert_eq!(result.providers.len(), 1);
+    }
+
+    // ---- Untrusted-response caps (#1352) ----
+
+    #[tokio::test]
+    async fn providers_per_response_is_capped() {
+        // One seed returns a flood of DISTINCT providers in a single response; the collected set must
+        // be bounded by the untrusted-response ceiling, not the raw flood.
+        let target = Key::from_bytes([0u8; 32]);
+        let seed = contact_from_key([0x10; 32]);
+        let flood: Vec<ProviderRecord> = (0u32..10_000)
+            .map(|i| {
+                let mut b = [0u8; 32];
+                b[0..4].copy_from_slice(&i.to_be_bytes());
+                ProviderRecord::new(&target, &PeerId::from_bytes(b), vec![], u64::MAX)
+            })
+            .collect();
+        let result = iterative_find(target, vec![seed], 20, 3, false, move |_c: Contact| {
+            let flood = flood.clone();
+            async move {
+                Ok(QueryOutcome {
+                    closer: vec![],
+                    providers: flood,
+                })
+            }
+        })
+        .await;
+        let cap = MAX_PROVIDERS_PER_RESPONSE.max(20 * 2);
+        assert!(
+            result.providers.len() <= cap,
+            "providers-per-response must be capped at {cap}, got {}",
+            result.providers.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn round_guard_terminates_a_non_converging_lookup() {
+        // An adversarial responder that ALWAYS returns a brand-new, strictly-closer contact would
+        // livelock a lookup forever without a round cap. The round guard (#1352) must bound total
+        // work: at most MAX_LOOKUP_ROUNDS rounds of alpha queries (+ the seed).
+        let target = Key::from_bytes([0xFF; 32]);
+        let seed = contact_from_key([0x00; 32]);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+        const ALPHA: usize = 3;
+        let result = iterative_find(target, vec![seed], 20, ALPHA, false, move |_c: Contact| {
+            let n = counter.fetch_add(1, Ordering::SeqCst);
+            // Each call fabricates a unique contact ever-closer to the target (high bytes = 0xFF),
+            // so the shortlist never converges — only the round guard stops it.
+            let mut b = [0xFFu8; 32];
+            b[24..32].copy_from_slice(&(n as u64).to_be_bytes());
+            async move {
+                Ok(QueryOutcome {
+                    closer: vec![contact_from_key(b)],
+                    providers: vec![],
+                })
+            }
+        })
+        .await;
+        let total = calls.load(Ordering::SeqCst);
+        assert!(
+            total <= MAX_LOOKUP_ROUNDS * ALPHA + 1,
+            "round guard must bound total queries to ~MAX_LOOKUP_ROUNDS*alpha, got {total}"
+        );
+        // It still terminates and returns a bounded result (proof it did not hang).
+        assert!(result.closest.len() <= 20);
     }
 
     // ---- Concurrency (MEDIUM/optimization: join_all awaits sequentially, SECURITY_AUDIT_P2P.md #179) ----

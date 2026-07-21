@@ -215,9 +215,93 @@ impl DhtService {
 
     /// Stop announcing `content` (the node no longer holds it). The record ages out of the DHT via
     /// TTL; we just stop republishing it. Returns whether it was being announced.
+    ///
+    /// This is the **passive** withdraw: it leaves this node's own local provider record in place
+    /// (it only expires with TTL) and merely stops re-publishing it, so a `find_providers` on this
+    /// node may still return self until the local record's TTL elapses. For an **immediate**
+    /// own-retract — the local-state half of the #1423 evict+retract step — use
+    /// [`retract_own_provider`](Self::retract_own_provider).
     pub async fn withdraw_provider(&self, content: &ContentId) -> bool {
         let key = content.to_key().to_hex();
         self.providers.lock().await.unmark_announced(&key)
+    }
+
+    // ---- Real-time holdings API (#1394 / #1423) ----------------------------------------------
+
+    /// Ingest a provider record for a THIRD-PARTY holder that the caller has ALREADY verified was
+    /// signed by `record.provider_peer_id` — the inbound-**add** half of the real-time holdings map
+    /// (SPEC §6.5). Returns the store admission outcome.
+    ///
+    /// This is the authenticated push path a node's announce receiver calls after verifying a
+    /// signed `HoldingsAnnounce` (dig-gossip opcode 222): the holder's signature has replaced mTLS
+    /// attribution as the proof of who provides the content, so — unlike the serving-side
+    /// `add_provider` (§6.4) — this method **bypasses the mTLS self-announce identity check** (the
+    /// caller, not the DHT, established authenticity). dig-dht itself stays crypto-free (SPEC §15):
+    /// it NEVER verifies a signature; passing an unverified record here is a caller bug that
+    /// poisons the local provider set.
+    ///
+    /// Every other admission guard still applies exactly as for `add_provider`: the address list is
+    /// capped ([`MAX_ADDRESSES_PER_RECORD`](crate::MAX_ADDRESSES_PER_RECORD)), `expires_at` is
+    /// clamped to `min(record.expires_at, now + provider_ttl)` (§6.2), and the per-key / global
+    /// admission caps (§6.3) are enforced — an over-capacity ingest returns
+    /// [`PutOutcome::RejectedOverCapacity`] and stores nothing. On acceptance the holder is folded
+    /// into the routing table so this node can reach it.
+    pub async fn ingest_verified_provider(&self, record: ProviderRecord) -> PutOutcome {
+        self.admit_verified_record(record).await
+    }
+
+    /// Remove exactly the local provider record for `(content_key, provider_peer_id)` — the
+    /// inbound-**retract** half of the real-time holdings map (SPEC §6.6). Returns whether a record
+    /// was removed.
+    ///
+    /// `content_key` and `provider_peer_id` are the 64-hex forms as they appear on a
+    /// [`ProviderRecord`] (`content` → `content.to_key().to_hex()`; the holder's `peer_id` hex).
+    /// The caller MUST have verified the retract was signed by that same `provider_peer_id`
+    /// (authenticated retract): a retract signed by one holder removes ONLY that holder's record and
+    /// can never evict another provider of the same key (censorship-resistance, §6.6). dig-dht does
+    /// not verify the signature (SPEC §15) — that is the caller's responsibility.
+    pub async fn remove_provider_record(&self, content_key: &str, provider_peer_id: &str) -> bool {
+        self.providers
+            .lock()
+            .await
+            .remove(content_key, provider_peer_id)
+    }
+
+    /// Actively retract THIS node's own provider record for `content`: remove the local record AND
+    /// stop republishing it, so `find_providers` on this node stops returning self as a holder
+    /// immediately (SPEC §6.6). Returns whether this node was providing the content (a local record
+    /// existed or the key was being announced).
+    ///
+    /// This is the local-state half of the #1423 atomic **evict + retract** step (on an LRU cache
+    /// eviction the node no longer serves the content). Unlike the passive
+    /// [`withdraw_provider`](Self::withdraw_provider) (which leaves the local record to expire via
+    /// TTL), this deletes it now. The copies previously PUT at the `k` closest peers are NOT deleted
+    /// by this call — they age out via TTL, or are removed sooner when dig-node floods the signed
+    /// retract announce and each recipient calls
+    /// [`remove_provider_record`](Self::remove_provider_record).
+    pub async fn retract_own_provider(&self, content: &ContentId) -> bool {
+        let key = content.to_key().to_hex();
+        let self_id = self.local_id.to_hex();
+        let mut ps = self.providers.lock().await;
+        let removed_record = ps.remove(&key, &self_id);
+        let was_announced = ps.unmark_announced(&key);
+        removed_record || was_announced
+    }
+
+    /// The `peer_id`s of the peers that hold `content` — a thin, address-free convenience over
+    /// [`find_providers`](Self::find_providers) for callers that only need "which peers hold X"
+    /// (e.g. an RPC holder-set query) and do not dial the holders themselves.
+    ///
+    /// `find_providers` remains the PRIMARY API: it returns full [`ProviderRecord`]s with candidate
+    /// addresses, which dig-download needs to actually connect and fetch. This method runs the same
+    /// distributed iterative lookup and simply projects each record to its holder `peer_id`
+    /// (records with a malformed peer id are skipped; the set is already deduped by provider).
+    pub async fn holders_of(&self, content: &ContentId) -> Result<Vec<PeerId>, DhtError> {
+        let records = self.find_providers(content).await?;
+        Ok(records
+            .iter()
+            .filter_map(|r| r.provider_peer_id())
+            .collect())
     }
 
     // ---- Maintenance -------------------------------------------------------------------------
@@ -350,7 +434,7 @@ impl DhtService {
                 let closer = self.routing.lock().await.closest(&key);
                 DhtResponse::Providers { providers, closer }
             }
-            DhtRequest::AddProvider { mut record } => {
+            DhtRequest::AddProvider { record } => {
                 // Self-announce check (SPEC §6.4, §14): when the caller identity is known (an
                 // authenticated transport), the record's provider_peer_id MUST be the caller itself.
                 // ProviderRecord carries no signature, so without this check any authenticated caller
@@ -369,31 +453,10 @@ impl DhtService {
                     }
                 }
 
-                // Cap the address list at the boundary BEFORE anything else (SPEC §5.5, §14): a
-                // `ProviderRecord` decoded off the wire bypasses `ProviderRecord::new`'s cap (its
-                // fields are public), so an attacker could otherwise pack thousands of addresses into
-                // one record within the 256 KiB frame limit — stored, folded into routing, and
-                // re-served (cloned) to every querying peer.
-                crate::record::sort_and_cap_addresses(&mut record.addresses);
-
-                // Clamp the inbound expires_at to our own TTL ceiling BEFORE admission/storage
-                // (SPEC §6.2, §14): an inbound record is never trusted to self-report its expiry.
-                // Without this, a record naming expires_at = u64::MAX would never GC (is_expired
-                // is `now >= expires_at`), making the memory it occupies permanent.
-                let clamp_ceiling = now_secs().saturating_add(self.config.provider_ttl_secs());
-                record.expires_at = record.expires_at.min(clamp_ceiling);
-
-                // Admission-controlled: put() enforces the per-key + global caps (SPEC §6.3, §14)
-                // so a flood of add_provider from one peer cannot grow the store without bound.
-                match self.providers.lock().await.put(record.clone()) {
-                    PutOutcome::Accepted => {
-                        // Fold the provider into our routing table (its addresses let us reach it).
-                        if let Some(pid) = record.provider_peer_id() {
-                            let contact = Contact::new(&pid, record.addresses.clone());
-                            let _ = self.routing.lock().await.insert(contact);
-                        }
-                        DhtResponse::AddProviderOk
-                    }
+                // Address-cap, TTL-clamp, admission-control, and (on acceptance) fold into routing —
+                // the shared verified-record admission pipeline (SPEC §6.3, §14).
+                match self.admit_verified_record(record).await {
+                    PutOutcome::Accepted => DhtResponse::AddProviderOk,
                     PutOutcome::RejectedOverCapacity => DhtResponse::Error {
                         code: 3,
                         message: "provider store over capacity".into(),
@@ -404,6 +467,38 @@ impl DhtService {
     }
 
     // ---- Internals ---------------------------------------------------------------------------
+
+    /// Admit a provider record whose provider attribution is ALREADY established — either the
+    /// serving-side mTLS self-announce check passed (`handle_request_from`'s `AddProvider` arm) or
+    /// the caller pre-verified the holder signature ([`ingest_verified_provider`]). This is the one
+    /// admission pipeline both paths share (SPEC §6.3, §14), in order:
+    ///
+    /// 1. **Cap the address list** at [`MAX_ADDRESSES_PER_RECORD`](crate::MAX_ADDRESSES_PER_RECORD)
+    ///    — a record decoded off the wire bypasses `ProviderRecord::new`'s cap (its fields are
+    ///    public), so an attacker could otherwise pack thousands of addresses into one record.
+    /// 2. **Clamp `expires_at`** to `now + provider_ttl` — an inbound record is never trusted to
+    ///    self-report its expiry; without this a record naming `u64::MAX` would never GC.
+    /// 3. **Admission-control** via [`ProviderStore::put`], enforcing the per-key + global caps so a
+    ///    flood cannot grow the store without bound.
+    /// 4. On [`PutOutcome::Accepted`], **fold the holder into the routing table** (its addresses let
+    ///    us reach it). A rejected record folds nothing.
+    ///
+    /// [`ingest_verified_provider`]: Self::ingest_verified_provider
+    async fn admit_verified_record(&self, mut record: ProviderRecord) -> PutOutcome {
+        crate::record::sort_and_cap_addresses(&mut record.addresses);
+
+        let clamp_ceiling = now_secs().saturating_add(self.config.provider_ttl_secs());
+        record.expires_at = record.expires_at.min(clamp_ceiling);
+
+        let outcome = self.providers.lock().await.put(record.clone());
+        if outcome == PutOutcome::Accepted {
+            if let Some(pid) = record.provider_peer_id() {
+                let contact = Contact::new(&pid, record.addresses.clone());
+                let _ = self.routing.lock().await.insert(contact);
+            }
+        }
+        outcome
+    }
 
     /// Build a provider record for content key `target` naming THIS node, expiring at
     /// `now + provider_ttl`.
