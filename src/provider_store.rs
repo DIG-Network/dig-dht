@@ -147,6 +147,25 @@ impl ProviderStore {
         PutOutcome::Accepted
     }
 
+    /// Remove exactly the record for `(content_key, provider_peer_id)`, if present. Returns whether
+    /// a record was removed.
+    ///
+    /// This is the store half of an **authenticated retract** (SPEC §6.6): a caller that has
+    /// verified a signed retract from `provider_peer_id` removes only that provider's record for
+    /// that key. It MUST NOT touch any OTHER provider of the same key — a retract signed by one
+    /// holder can never evict another holder's record (censorship-resistance). A content key left
+    /// with no remaining providers is dropped so the store does not accumulate empty entries.
+    pub fn remove(&mut self, content_key: &str, provider_peer_id: &str) -> bool {
+        let Some(providers) = self.by_key.get_mut(content_key) else {
+            return false;
+        };
+        let removed = providers.remove(provider_peer_id).is_some();
+        if providers.is_empty() {
+            self.by_key.remove(content_key);
+        }
+        removed
+    }
+
     /// The live (non-expired at `now`) provider records for `content_key`. Expired records are
     /// skipped (and cleaned up by [`gc`](Self::gc)); returns an empty vec if none are known/live.
     pub fn get(&self, content_key: &str, now: u64) -> Vec<ProviderRecord> {
@@ -361,6 +380,54 @@ mod tests {
             s.get(&legit.to_hex(), 0).len(),
             1,
             "the legitimate key's record must survive"
+        );
+    }
+
+    #[test]
+    fn remove_deletes_only_the_named_provider_record() {
+        // Authenticated retract (SPEC §6.6): removing (key, provider-1) must leave provider-2 of the
+        // SAME key untouched — a retract signed by one holder cannot censor another holder.
+        let mut s = ProviderStore::new();
+        let key = Key::from_bytes([0xAA; 32]);
+        s.put(rec(&key, 1, 100));
+        s.put(rec(&key, 2, 100));
+        let pid1 = PeerId::from_bytes([1u8; 32]).to_hex();
+        let pid2 = PeerId::from_bytes([2u8; 32]).to_hex();
+        assert!(
+            s.remove(&key.to_hex(), &pid1),
+            "the named record was removed"
+        );
+        let survivors: std::collections::HashSet<String> = s
+            .get(&key.to_hex(), 0)
+            .into_iter()
+            .map(|r| r.provider_peer_id)
+            .collect();
+        assert_eq!(survivors.len(), 1, "the other provider must survive");
+        assert!(survivors.contains(&pid2));
+        assert!(!survivors.contains(&pid1));
+    }
+
+    #[test]
+    fn remove_of_absent_record_returns_false() {
+        let mut s = ProviderStore::new();
+        let key = Key::from_bytes([0xAA; 32]);
+        s.put(rec(&key, 1, 100));
+        let absent = PeerId::from_bytes([9u8; 32]).to_hex();
+        assert!(!s.remove(&key.to_hex(), &absent), "no such provider");
+        assert!(!s.remove(&"00".repeat(32), &absent), "no such content key");
+        assert_eq!(s.len(), 1, "nothing removed");
+    }
+
+    #[test]
+    fn remove_drops_content_key_when_last_provider_leaves() {
+        let mut s = ProviderStore::new();
+        let key = Key::from_bytes([0xAA; 32]);
+        s.put(rec(&key, 1, 100));
+        let pid1 = PeerId::from_bytes([1u8; 32]).to_hex();
+        assert!(s.remove(&key.to_hex(), &pid1));
+        assert!(
+            s.is_empty(),
+            "the now-empty content key must be dropped entirely"
         );
     }
 

@@ -583,6 +583,239 @@ async fn add_provider_with_no_authenticated_caller_is_still_accepted() {
 }
 
 #[tokio::test]
+async fn find_providers_discovers_a_stranger_purely_via_iterative_lookup() {
+    // Regression guard for the DISTRIBUTED property (the engine of #1394/#1423): a seeker that has
+    // received NO announce/gossip from the holder — its local provider store is empty for the key —
+    // must still DISCOVER the holder purely by walking the iterative Kademlia lookup toward the
+    // content key. Proves fetch-from-strangers is real, not a same-node local-store artifact.
+    let router = SwarmRouter::new();
+    // Small `k` so `announce_provider` PUTs the record at only a FEW closest peers — guaranteeing
+    // some node in the swarm did NOT receive it locally and can act as a genuine stranger seeker.
+    let config = DhtConfig {
+        k: 4,
+        ..Default::default()
+    };
+    let nodes = build_swarm(&router, 20, &config).await;
+
+    let holder = &nodes[9];
+    let content = ContentId::capsule([0xA1; 32], [0xB2; 32]);
+    let accepted = holder.announce_provider(&content).await.unwrap();
+    assert!(accepted > 0, "announce must PUT the record at some peers");
+
+    // Find a seeker that holds NOTHING locally for this key — anything it returns therefore came
+    // from the network walk, not a local short-circuit.
+    let key = content.to_key();
+    let mut seeker = None;
+    for n in &nodes {
+        if n.local_id() == holder.local_id() {
+            continue;
+        }
+        let local_only = n
+            .handle_request(DhtRequest::FindProviders {
+                content_key: key.to_hex(),
+            })
+            .await;
+        if let DhtResponse::Providers { providers, .. } = local_only {
+            if providers.is_empty() {
+                seeker = Some(n);
+                break;
+            }
+        }
+    }
+    let seeker = seeker.expect("a stranger node with no local record for the key must exist");
+
+    let found = seeker.find_providers(&content).await.unwrap();
+    assert_eq!(
+        found.len(),
+        1,
+        "the stranger holder is discovered via lookup"
+    );
+    assert_eq!(found[0].provider_peer_id, holder.local_id().to_hex());
+}
+
+#[tokio::test]
+async fn ingest_verified_provider_bypasses_self_announce_but_still_clamps_and_caps() {
+    // SPEC §6.5: the authenticated-ingest path stores a THIRD-PARTY record (provider != this node,
+    // no mTLS self-announce match) — proving the identity-check bypass — yet still clamps the TTL
+    // and caps the address list.
+    use dig_dht::provider_store::PutOutcome;
+
+    let router = SwarmRouter::new();
+    let short_ttl = std::time::Duration::from_secs(60);
+    let config = DhtConfig {
+        provider_ttl: short_ttl,
+        ..Default::default()
+    };
+    let node = make_node(&router, pid(0x40, 0), config).await;
+
+    let content = ContentId::store([0xC1; 32]);
+    let holder = pid(0x41, 0); // a THIRD party, NOT the ingesting node
+    let flood: Vec<CandidateAddr> = (0..2000)
+        .map(|i| CandidateAddr::direct(format!("203.0.113.{}", i % 255), 9444))
+        .collect();
+    let record = dig_dht::ProviderRecord {
+        content_key: content.to_key().to_hex(),
+        provider_peer_id: holder.to_hex(),
+        addresses: flood,
+        expires_at: u64::MAX, // "never expires"
+    };
+
+    let outcome = node.ingest_verified_provider(record).await;
+    assert_eq!(outcome, PutOutcome::Accepted, "third-party ingest accepted");
+
+    // Read back via the wire-facing path: stored despite provider != node (bypass), TTL clamped,
+    // addresses capped.
+    let resp = node
+        .handle_request(DhtRequest::FindProviders {
+            content_key: content.to_key().to_hex(),
+        })
+        .await;
+    let stored = match resp {
+        DhtResponse::Providers { providers, .. } => providers,
+        other => panic!("expected Providers, got {other:?}"),
+    };
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].provider_peer_id, holder.to_hex());
+    assert_eq!(
+        stored[0].addresses.len(),
+        dig_dht::record::MAX_ADDRESSES_PER_RECORD,
+        "ingested address list must be capped"
+    );
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    assert!(
+        stored[0].expires_at <= now + short_ttl.as_secs() + 5,
+        "ingested expires_at must be clamped to local TTL, got {}",
+        stored[0].expires_at
+    );
+}
+
+#[tokio::test]
+async fn ingest_verified_provider_still_rejects_over_global_capacity() {
+    // SPEC §6.5: bypassing the identity check does NOT bypass admission control — a global-cap
+    // overflow is still rejected and stores nothing.
+    use dig_dht::provider_store::{ProviderStoreLimits, PutOutcome};
+
+    let router = SwarmRouter::new();
+    let config = DhtConfig {
+        provider_store_limits: ProviderStoreLimits {
+            max_providers_per_key: 20,
+            max_total_records: 1,
+        },
+        ..Default::default()
+    };
+    let node = make_node(&router, pid(0x42, 0), config).await;
+
+    let mk = |tag: u8| dig_dht::ProviderRecord {
+        content_key: ContentId::store([tag; 32]).to_key().to_hex(),
+        provider_peer_id: pid(0x43, tag).to_hex(),
+        addresses: addr(),
+        expires_at: u64::MAX,
+    };
+    assert_eq!(
+        node.ingest_verified_provider(mk(1)).await,
+        PutOutcome::Accepted
+    );
+    assert_eq!(
+        node.ingest_verified_provider(mk(2)).await,
+        PutOutcome::RejectedOverCapacity,
+        "ingest over the global ceiling must be rejected"
+    );
+}
+
+#[tokio::test]
+async fn remove_provider_record_removes_only_the_named_signer() {
+    // SPEC §6.6: an authenticated retract removes exactly the (key, signer) record and leaves other
+    // providers of the same key intact (censorship-resistance).
+    let router = SwarmRouter::new();
+    let node = make_node(&router, pid(0x44, 0), DhtConfig::default()).await;
+
+    let content = ContentId::store([0xD1; 32]);
+    let key_hex = content.to_key().to_hex();
+    let holder_a = pid(0x45, 0);
+    let holder_b = pid(0x46, 0);
+    for h in [&holder_a, &holder_b] {
+        let rec = dig_dht::ProviderRecord::new(&content.to_key(), h, addr(), u64::MAX);
+        node.ingest_verified_provider(rec).await;
+    }
+
+    assert!(
+        node.remove_provider_record(&key_hex, &holder_a.to_hex())
+            .await,
+        "the named record is removed"
+    );
+    assert!(
+        !node
+            .remove_provider_record(&key_hex, &holder_a.to_hex())
+            .await,
+        "removing an already-gone record returns false"
+    );
+
+    let resp = node
+        .handle_request(DhtRequest::FindProviders {
+            content_key: key_hex.clone(),
+        })
+        .await;
+    match resp {
+        DhtResponse::Providers { providers, .. } => {
+            assert_eq!(providers.len(), 1, "the other holder survives the retract");
+            assert_eq!(providers[0].provider_peer_id, holder_b.to_hex());
+        }
+        other => panic!("expected Providers, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn retract_own_provider_removes_self_from_find_providers_immediately() {
+    // SPEC §6.6: the active own-retract deletes this node's local record now, so a solo node's
+    // find_providers stops returning self immediately (the local-state half of #1423 evict+retract).
+    let router = SwarmRouter::new();
+    let solo = make_node(&router, pid(0x47, 0), DhtConfig::default()).await;
+    let content = ContentId::capsule([0xE1; 32], [0xE2; 32]);
+
+    solo.announce_provider(&content).await.unwrap();
+    let before = solo.find_providers(&content).await.unwrap();
+    assert_eq!(before.len(), 1, "self is a provider after announce");
+    assert_eq!(before[0].provider_peer_id, solo.local_id().to_hex());
+
+    assert!(
+        solo.retract_own_provider(&content).await,
+        "was providing → true"
+    );
+    let after = solo.find_providers(&content).await.unwrap();
+    assert!(
+        after.is_empty(),
+        "self must be gone from find_providers immediately after retract"
+    );
+    // Republish now has nothing to do (announcement was unmarked too).
+    assert_eq!(solo.republish().await, 0);
+    assert!(
+        !solo.retract_own_provider(&content).await,
+        "second retract → not providing"
+    );
+}
+
+#[tokio::test]
+async fn holders_of_returns_peer_ids_over_the_distributed_lookup() {
+    // SPEC §6.5: the thin holder-set query returns exactly the holder peer_ids find_providers finds.
+    let router = SwarmRouter::new();
+    let config = DhtConfig::default();
+    let nodes = build_swarm(&router, 15, &config).await;
+
+    let content = ContentId::store([0xF1; 32]);
+    nodes[4].announce_provider(&content).await.unwrap();
+    nodes[10].announce_provider(&content).await.unwrap();
+
+    let holders = nodes[1].holders_of(&content).await.unwrap();
+    let got: std::collections::HashSet<String> = holders.iter().map(|p| p.to_hex()).collect();
+    assert!(got.contains(&nodes[4].local_id().to_hex()));
+    assert!(got.contains(&nodes[10].local_id().to_hex()));
+    assert_eq!(got.len(), 2, "exactly the two distinct holders, deduped");
+}
+
+#[tokio::test]
 async fn withdraw_provider_stops_republish() {
     let router = SwarmRouter::new();
     let config = DhtConfig::default();

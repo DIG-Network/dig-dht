@@ -299,6 +299,57 @@ first-returned providers, this can also skew which legitimate providers get trie
   signed-record scheme (provider signs `content_key ‖ addresses ‖ expires_at`) would allow
   authenticated third-party relaying; until then, third-party announces are simply rejected.
 
+### 6.5 Authenticated ingest (real-time holdings — engine of the content-replication flywheel)
+
+The serving-side `add_provider` (§6.4) constrains announces to **self-announces** because a
+`ProviderRecord` carries no signature and mTLS attribution is all the responder has. The real-time
+holdings map lifts that constraint by moving verification to the CALLER: a node's announce receiver
+verifies a signed holdings announce (the caller's cryptographic proof of who provides the content),
+then pushes the already-verified record into the DHT store via **`ingest_verified_provider`**.
+
+- **`ingest_verified_provider(record) -> PutOutcome`** — store a record whose `provider_peer_id`
+  attribution the caller has ALREADY verified (a signature the caller checked; the DHT never sees
+  it). Because that verification replaces mTLS attribution, this path **bypasses the §6.4
+  self-announce identity check** — a node may thereby ingest a record naming a *third party* as the
+  holder, which `add_provider` forbids. **This is the ONLY sanctioned bypass of §6.4**, and it is
+  sound only because the caller established authenticity out-of-band.
+- **dig-dht stays crypto-free (§15).** `ingest_verified_provider` performs NO signature check; the
+  caller is solely responsible for verifying the holder signature before calling. Passing an
+  unverified record is a caller bug that poisons the local provider set — the DHT cannot detect it.
+- **Every other admission guard still applies, identically to `add_provider`:** the address list is
+  capped (§5.5), `expires_at` is clamped to `min(record.expires_at, now + provider_ttl)` (§6.2),
+  and the per-key + global admission caps (§6.3) are enforced — an over-capacity ingest returns
+  `RejectedOverCapacity` and stores nothing. On acceptance the holder is folded into the routing
+  table. `add_provider` (§6.4) and `ingest_verified_provider` share ONE admission pipeline; only the
+  identity check differs (present for the former, delegated to the caller for the latter).
+- **No chain anchor on ingest (NC-9).** Ingest does NOT require an on-chain proof — anchoring stays
+  at FETCH time (the download layer's verification), because requiring a chain read per ingested
+  announce would itself be a DoS vector. Ingest is bounded purely by the admission caps above.
+
+### 6.6 Authenticated retract and active own-retract
+
+Provider records are soft state that normally age out via TTL (§6.2). Two operations remove a record
+**immediately**, for the content-replication flywheel where a holder that drops content must stop
+being advertised at once rather than after a TTL:
+
+- **`remove_provider_record(content_key, provider_peer_id) -> bool`** (inbound retract) — remove
+  exactly the local record for `(content_key, provider_peer_id)`. Returns whether a record was
+  removed. The caller MUST have verified the retract was signed by that same `provider_peer_id`
+  (the DHT does not, §15). It MUST remove ONLY that (key, signer) record — **a retract signed by one
+  holder can never evict another provider of the same key** (censorship-resistance). A content key
+  left with no remaining providers is dropped.
+- **`retract_own_provider(content) -> bool`** (active own-retract) — remove THIS node's own local
+  provider record for `content` AND unmark it for republish, so `find_providers` on this node stops
+  returning self as a holder immediately. Returns whether this node was providing the content.
+  Contrast **`withdraw_provider`** (§9.2), which is passive (stops republish only, leaves the local
+  record to expire via TTL). `retract_own_provider` is the local-state half of the flywheel's atomic
+  **evict + retract** step; the copies previously PUT at the `k` closest peers are NOT deleted by
+  this call — they age out via TTL, or sooner when the node floods the signed retract announce and
+  each recipient calls `remove_provider_record`.
+- **`holders_of(content) -> Result<Vec<PeerId>, DhtError>`** — a thin, address-free projection over `find_providers`
+  (§9.2) for callers that only need "which peers hold X". `find_providers` (which returns full
+  records with candidate addresses the download layer dials) remains the PRIMARY query.
+
 ## 7. Routing table
 
 ### 7.1 Structure
@@ -357,6 +408,19 @@ and `α`:
 7. **Result:** the up-to-`k` closest **non-failed** contacts (closest-first) plus all distinct
    provider records collected.
 
+**Untrusted-response bounds (wire contract).** A lookup consumes responses from untrusted peers, so
+it MUST bound what any one response — or a colluding swarm — can impose:
+
+- **Providers per response** — at most `max(64, 2·k)` provider records from a single response are
+  folded into the collected set (the honest per-key cap is `max_providers_per_key`); the rest are
+  discarded. Bounds the collected-providers map against a peer that packs an unbounded set into one
+  frame.
+- **Closer contacts per response** — at most `max(64, 2·k)` `closer`/`nodes` contacts from a single
+  response are merged; the rest are discarded. Bounds per-round merge work.
+- **Round guard** — a lookup runs at most `MAX_LOOKUP_ROUNDS` (64) iterative rounds. An honest
+  lookup converges in O(log n) rounds; the guard only trips on an adversarial swarm feeding endless
+  ever-closer contacts to livelock convergence, and guarantees the lookup always terminates.
+
 **Client probe:** the client-side lookup issues `find_providers` as its per-peer probe for *all*
 lookup flavours (bootstrap self-lookup, `find_node`, announce placement, and provider lookup),
 because its response carries both closer contacts and any providers. A `nodes` response is also
@@ -395,6 +459,13 @@ the bootstrap contacts) and absorb the discovered contacts. Returns the number o
   table returns whatever is held locally (possibly empty).
 - **`find_node(peer_id)`** — iterative lookup toward the peer's key; returns the converged closest
   contacts. Errors with `NoPeers` when the routing table is empty.
+- **`holders_of(content)`** — the peer ids of the holders `find_providers` finds; an address-free
+  projection over `find_providers` (§6.6). Same distributed lookup, same errors.
+
+**Real-time holdings operations** (§6.5, §6.6) — `ingest_verified_provider(record)` (authenticated
+third-party inbound add), `remove_provider_record(content_key, provider_peer_id)` (authenticated
+inbound retract), and `retract_own_provider(content)` (active own-retract) — mutate the local
+provider store directly for the content-replication flywheel and are specified in §6.5/§6.6.
 
 All lookups **absorb** the converged contacts back into the routing table. A full bucket's
 LRS-report is left to ping-and-replace maintenance — lookups never block on a liveness ping.
@@ -544,7 +615,9 @@ Exported from the crate root (`#![forbid(unsafe_code)]`, MSRV **1.75.0**, licens
   `bootstrap(&[BootstrapPeer])`, `find_node(&PeerId)`, `find_providers(&ContentId)`,
   `announce_provider(&ContentId)`, `withdraw_provider(&ContentId)`, `republish()`,
   `refresh_buckets()`, `gc()`, `ping(&Contact)`, `handle_request(DhtRequest)`,
-  `handle_request_from(Option<Contact>, DhtRequest)`, `known_closest(&Key)`, `routing_len()`.
+  `handle_request_from(Option<Contact>, DhtRequest)`, `known_closest(&Key)`, `routing_len()`,
+  `ingest_verified_provider(ProviderRecord)`, `remove_provider_record(String, PeerId)`,
+  `retract_own_provider(&ContentId)`, `holders_of(&ContentId)`.
 - `DhtConfig` (§12), `ContentId` (§3–4), `Key` / `Distance` (§2), `ProviderRecord` /
   `CandidateAddr` / `AddressKind` / `MAX_ADDRESSES_PER_RECORD` (§5.5, §6), `Contact` /
   `RoutingTable` (§7), `BootstrapPeer` (§9.1), `DhtTransport` (§11), `DhtRequest` / `DhtResponse` +
