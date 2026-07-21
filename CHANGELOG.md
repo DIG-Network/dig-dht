@@ -7,12 +7,7 @@ This project adheres to [Semantic Versioning](https://semver.org) and
 ## [0.4.0] - 2026-07-21
 
 ### Features
-- **dig-dht:** Real-time holdings API — authenticated third-party ingest
-  (`ingest_verified_provider`), authenticated inbound retract (`remove_provider_record`), active
-  own-retract (`retract_own_provider`), and a thin holder-set query (`holders_of`); the engine of
-  the #1394 real-time capsule-holder map / #1423 content-replication flywheel (#1424)
-- **dig-dht:** Untrusted-response bounds on the iterative lookup — providers-per-response,
-  closer-contacts-per-response, and a round guard (#1352)
+- **dig-dht:** Holdings ingest + active retract + holder-set query (#1424) (#8)
 
 ## [0.3.0] - 2026-07-21
 
