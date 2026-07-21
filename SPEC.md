@@ -591,3 +591,5 @@ Cross-repo: the wire and keyspace contracts above must match the DIG Protocol **
 (docs.dig.net → Protocol → Peer network, §4c and its conformance table) exactly; `dig-nat` provides
 the transport + `PeerId`, `dig-download` consumes `find_providers` results, and `dig-node` embeds
 the service and wires both transport halves.
+
+<!-- WIP #1424: holdings ingest/retract/query API -->
