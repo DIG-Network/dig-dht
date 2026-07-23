@@ -16,7 +16,7 @@
 # in-memory transport harness (NO real network).
 [package]
 name = "dig-dht"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2021"
 rust-version = "1.75.0"
 license = "Apache-2.0 OR MIT"
@@ -31,14 +31,13 @@ categories = ["network-programming"]
 # keys its k-buckets by dig-nat's `PeerId` and carries its RPC over dig-nat `PeerConnection` streams.
 #
 # Sourcing: dig-nat is published to crates.io, so we resolve the plain crates.io version (NC-7:
-# prefer the crates.io release over a bare-git source). `0.10` carries dig-nat's §5.2 STUN
-# happy-eyeballs reflexive-discovery work; the one renamed symbol in that release
-# (`client_config_spki_pinned`) is not used here, and the `connect`/`connect_with_runtime`/
-# `NatRuntime` ladder plus `PeerId`/`PeerConnection` (re-exported unchanged from dig-tls through
-# dig-nat) are untouched, so this bump touches nothing beyond the pinned version. Moving the
-# PUBLIC dig-nat dep 0.8 -> 0.10 is breaking for dig-dht's own consumers, who must upgrade to
-# dig-nat 0.10 in lockstep (a single dig-nat version in the final tree) — release-first cascade #1494.
-dig-nat = "0.10"
+# prefer the crates.io release over a bare-git source). `0.11` adds dig-nat's relay-accept path
+# (`enable_accept`), which is purely ADDITIVE over `0.10` and unused here — the `connect`/
+# `connect_with_runtime`/`NatRuntime` ladder plus `PeerId`/`PeerConnection` (re-exported unchanged
+# from dig-tls through dig-nat) are untouched, so this bump touches nothing beyond the pinned
+# version. dig-dht's own consumers must upgrade to dig-nat 0.11 in lockstep (a single dig-nat
+# version in the final tree) — release-first cascade #1550.
+dig-nat = "0.11"
 
 # Address-family (IPv6-first / IPv4-fallback) contract — the ecosystem's single source of truth for
 # `Family::of` classification (CLAUDE.md §5.2, epic #1020). The DHT derives the FAMILY half of its
