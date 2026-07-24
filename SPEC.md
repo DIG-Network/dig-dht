@@ -441,6 +441,17 @@ the bootstrap contacts) and absorb the discovered contacts. Returns the number o
   introducer); the crate takes them as input and MUST NOT hard-depend on a live relay.
 - Bootstrap is idempotent-by-merge: calling it repeatedly merges, never resets.
 
+`bootstrap` is a one-shot, network-bound seed run against a KNOWN set of peers. It cannot cover a
+freshly-formed network where no peers are connected yet at bring-up time (routing would stay empty
+and discovery would be impossible). For that, the routing table is also fed LIVE as peers connect:
+
+- **`add_peer(peer_id, addresses)`** — insert one connected peer into the routing table WITHOUT a
+  network round-trip. Driven by the host's live peer-membership signal (a `dig-gossip`
+  `PoolEvent::PeerAdded`), so routing populates as the pool fills. Idempotent-by-merge (§7.2); a
+  self-id is a no-op (§7.1).
+- **`remove_peer(peer_id_hex)`** — evict a departed peer (a `PoolEvent::PeerRemoved`) so lookups
+  never seed from a dead contact. Returns whether it was present.
+
 ### 9.2 Announce / withdraw / find
 
 - **`announce_provider(content)`** — build a provider record naming THIS node (its id + advertised
