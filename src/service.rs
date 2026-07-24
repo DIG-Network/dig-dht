@@ -132,6 +132,27 @@ impl DhtService {
         Ok(self.routing.lock().await.len())
     }
 
+    /// Add a single live peer to the routing table as it connects (e.g. a `dig-gossip`
+    /// `PoolEvent::PeerAdded`), WITHOUT the network round-trip [`bootstrap`](Self::bootstrap) does.
+    ///
+    /// This is the LIVE seam the one-shot pre-connect bootstrap cannot cover: in a freshly-formed
+    /// network the pool is empty when `bootstrap` runs, so routing stays empty and `find_providers`
+    /// finds nobody. Feeding each connected peer here populates routing as the pool fills, which is
+    /// what makes cross-node discovery work (#1574). Idempotent — re-adding a known peer merges its
+    /// address(es) via the routing table's insert policy; adding this node's own id is a no-op.
+    pub async fn add_peer(&self, peer_id: &PeerId, addresses: Vec<CandidateAddr>) {
+        let contact = Contact::new(peer_id, addresses);
+        let _ = self.routing.lock().await.insert(contact);
+    }
+
+    /// Remove a peer from the routing table as it leaves (a `dig-gossip` `PoolEvent::PeerRemoved`),
+    /// keeping routing accurate so lookups don't seed from a dead contact. Returns whether it was
+    /// present. `peer_id_hex` is the 64-char hex id (as carried on `Contact::provider_peer_id` /
+    /// [`PeerId::to_hex`]).
+    pub async fn remove_peer(&self, peer_id_hex: &str) -> bool {
+        self.routing.lock().await.remove(peer_id_hex)
+    }
+
     // ---- Client operations -------------------------------------------------------------------
 
     /// Find the `k` peers closest to `peer_id` (the routing primitive). Runs an iterative

@@ -145,6 +145,67 @@ async fn build_swarm(router: &SwarmRouter, n: u8, config: &DhtConfig) -> Vec<Arc
     nodes
 }
 
+/// Regression for #1574: a freshly-formed network whose routing is seeded LIVE from gossip
+/// `PoolEvent::PeerAdded` (via [`DhtService::add_peer`]) — NOT from the one-shot pre-connect
+/// bootstrap — must still discover a holder cross-node.
+///
+/// This reproduces the real dig-node defect: `bring_up_dht` runs `bootstrap` BEFORE any peer
+/// connects, so in a just-formed network the routing table is empty and `find_providers` finds
+/// nobody. The fix feeds each connected peer into routing as it joins. The first assertion proves
+/// the empty-routing failure mode; the rest prove `add_peer` restores cross-node discovery.
+#[tokio::test]
+async fn add_peer_seeds_routing_so_fresh_network_discovers_holder() {
+    let router = SwarmRouter::new();
+    let config = DhtConfig::default();
+
+    // Two nodes come up with NO bootstrap (the pool was empty when bring-up ran).
+    let holder = make_node(&router, pid(1, 0), config.clone()).await;
+    let seeker = make_node(&router, pid(2, 0), config.clone()).await;
+
+    let content = ContentId::capsule([0x42; 32], [0x24; 32]);
+
+    // Pre-fix reality: routing is empty, so the seeker discovers nobody even though the holder
+    // announced. announce_provider PUTs nothing (no peers), and find_providers returns empty.
+    holder.announce_provider(&content).await.unwrap();
+    let before = seeker.find_providers(&content).await.unwrap();
+    assert!(
+        before.is_empty(),
+        "with empty routing (no live seeding) discovery is impossible — this is the #1574 bug"
+    );
+
+    // The fix: gossip PeerAdded feeds each connected peer into routing as it joins.
+    holder.add_peer(seeker.local_id(), addr()).await;
+    seeker.add_peer(holder.local_id(), addr()).await;
+    assert!(holder.routing_len().await > 0, "add_peer populates routing");
+    assert!(seeker.routing_len().await > 0, "add_peer populates routing");
+
+    // Holder re-announces now that it has peers to PUT to; the seeker finds it.
+    let accepted = holder.announce_provider(&content).await.unwrap();
+    assert!(accepted > 0, "announce now reaches the live peer");
+    let providers = seeker.find_providers(&content).await.unwrap();
+    assert_eq!(providers.len(), 1, "the holder is discovered cross-node");
+    assert_eq!(providers[0].provider_peer_id, holder.local_id().to_hex());
+    assert!(providers[0].best_address().is_some());
+}
+
+/// #1574: `remove_peer` evicts a departed peer so routing stays accurate.
+#[tokio::test]
+async fn remove_peer_evicts_from_routing() {
+    let router = SwarmRouter::new();
+    let config = DhtConfig::default();
+    let node = make_node(&router, pid(1, 0), config.clone()).await;
+    let other = make_node(&router, pid(2, 0), config).await;
+
+    node.add_peer(other.local_id(), addr()).await;
+    assert_eq!(node.routing_len().await, 1);
+    assert!(node.remove_peer(&other.local_id().to_hex()).await);
+    assert_eq!(node.routing_len().await, 0);
+    assert!(
+        !node.remove_peer(&other.local_id().to_hex()).await,
+        "removing an absent peer returns false"
+    );
+}
+
 #[tokio::test]
 async fn announce_then_find_providers_roundtrip() {
     let router = SwarmRouter::new();
