@@ -544,7 +544,7 @@ dependencies = [
 
 [[package]]
 name = "dig-dht"
-version = "0.6.0"
+version = "0.5.2"
 dependencies = [
  "async-trait",
  "dig-ip",
