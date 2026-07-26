@@ -196,6 +196,8 @@ impl DhtService {
         // Merge local + discovered, dedup by provider, drop expired. Discovered records come
         // straight off the wire from other peers' responses, bypassing `ProviderRecord::new`'s
         // address cap — capped here before handing them back to our caller (SPEC §5.5, §14).
+        // Records for a key we did not query were already discarded at the wire boundary in
+        // `run_lookup`'s query closure (SPEC §6.7), so every record here is for `target`.
         let mut discovered = result.providers;
         for r in &mut discovered {
             crate::record::sort_and_cap_addresses(&mut r.addresses);
@@ -555,9 +557,29 @@ impl DhtService {
             let content_key = content_key.clone();
             let from = from.clone();
             async move {
-                let req = DhtRequest::FindProviders { content_key };
+                let req = DhtRequest::FindProviders {
+                    content_key: content_key.clone(),
+                };
                 match transport.rpc(&from, &contact, &req).await {
-                    Ok(DhtResponse::Providers { providers, closer }) => {
+                    Ok(DhtResponse::Providers {
+                        mut providers,
+                        closer,
+                    }) => {
+                        // Answer-to-question binding (SPEC §6.7, §14): keep only records for the
+                        // key we actually asked about. A responder is free to say ANYTHING here —
+                        // `ProviderRecord` carries no signature and the peer is not the record's
+                        // subject — so without this equality check any peer on the lookup path
+                        // could stamp arbitrary provider peer_ids and address hints onto records
+                        // for keys the finder never queried, and the finder would return them to
+                        // its caller as dial targets (dial fan-out / wasted-dial DoS, and a
+                        // spirit-defeat of the #1490 amplification bound).
+                        //
+                        // Filtering HERE, at the wire boundary, rather than at the final merge is
+                        // load-bearing: the lookup's `stop_on_providers` early exit fires as soon
+                        // as any provider is collected, so a mismatched record counted as "found"
+                        // would end the walk before it reached a real holder — discovery
+                        // censorship. Nothing downstream of this point sees an off-key record.
+                        providers.retain(|r| r.content_key == content_key);
                         Ok(QueryOutcome { closer, providers })
                     }
                     Ok(DhtResponse::Nodes { nodes }) => Ok(QueryOutcome {

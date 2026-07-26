@@ -891,3 +891,115 @@ async fn withdraw_provider_stops_republish() {
     // Republish now has nothing to do.
     assert_eq!(nodes[6].republish().await, 0);
 }
+
+// ---- A queried peer's answer is untrusted input (#1621) ---------------------------------------
+
+/// A single-peer transport whose responder answers **every** `find_providers` with one provider
+/// record stamped with `answer_content_key`, regardless of which key was actually asked for.
+///
+/// This is the misbehaviour double for #1621. It is deliberately parameterized on the stamped key
+/// rather than hard-wired to a mismatching one, so the SAME double expresses both the lie (a record
+/// for a key the finder never asked about) and the truth (a record for the queried key). A double
+/// that could only ever lie would leave "the filter drops everything" indistinguishable from "the
+/// filter works".
+struct StampingTransport {
+    /// The `content_key` every answered record carries.
+    answer_content_key: String,
+    /// The `peer_id` every answered record names as the holder.
+    answer_provider: PeerId,
+}
+
+#[async_trait]
+impl DhtTransport for StampingTransport {
+    async fn rpc(
+        &self,
+        _from: &Contact,
+        _peer: &Contact,
+        request: &DhtRequest,
+    ) -> Result<DhtResponse, DhtError> {
+        match request {
+            DhtRequest::FindProviders { .. } => Ok(DhtResponse::Providers {
+                providers: vec![dig_dht::ProviderRecord {
+                    content_key: self.answer_content_key.clone(),
+                    provider_peer_id: self.answer_provider.to_hex(),
+                    addresses: addr(),
+                    expires_at: u64::MAX,
+                }],
+                closer: vec![],
+            }),
+            DhtRequest::Ping { nonce } => Ok(DhtResponse::Pong { nonce: *nonce }),
+            _ => Err(DhtError::transport("unsupported in this harness")),
+        }
+    }
+}
+
+/// Build a lone seeker whose only known peer answers with records stamped `answer_content_key`.
+async fn seeker_against_stamping_peer(answer_content_key: String) -> Arc<DhtService> {
+    let responder = pid(0xEE, 0x01);
+    let seeker = Arc::new(DhtService::new(
+        pid(0x11, 0x01),
+        addr(),
+        DhtConfig::default(),
+        Arc::new(StampingTransport {
+            answer_content_key,
+            answer_provider: responder,
+        }),
+    ));
+    seeker.add_peer(&responder, addr()).await;
+    seeker
+}
+
+#[tokio::test]
+async fn find_providers_drops_records_for_a_key_it_did_not_ask_about() {
+    // #1621: any peer on the lookup path can stamp arbitrary peer_id + address hints onto a record
+    // for a key the finder never queried. Those records flow straight into the caller's dial set,
+    // so the finder MUST discard every record whose content_key is not the queried key. Stated over
+    // the CLASS (any non-matching key), not one incident.
+    let wanted = ContentId::store([0xA1; 32]);
+    let never_asked_for = ContentId::store([0xB2; 32]).to_key().to_hex();
+
+    let seeker = seeker_against_stamping_peer(never_asked_for).await;
+    let found = seeker.find_providers(&wanted).await.unwrap();
+
+    assert!(
+        found.is_empty(),
+        "a record stamped with an unqueried content_key must contribute nothing, got {found:?}"
+    );
+}
+
+#[tokio::test]
+async fn find_providers_keeps_records_for_exactly_the_queried_key() {
+    // The truthful half of the same double: the filter must be an equality check on the queried
+    // key, not a blanket drop of everything a peer returns.
+    let wanted = ContentId::store([0xA1; 32]);
+    let seeker = seeker_against_stamping_peer(wanted.to_key().to_hex()).await;
+
+    let found = seeker.find_providers(&wanted).await.unwrap();
+
+    assert_eq!(found.len(), 1, "a record for the queried key is kept");
+    assert_eq!(found[0].content_key, wanted.to_key().to_hex());
+}
+
+#[tokio::test]
+async fn a_mismatched_answer_does_not_end_the_lookup_early() {
+    // The one-off variant that matters most: `find_providers` stops as soon as ANY provider is
+    // collected. If mismatched records were counted as "found", one lying peer could halt the walk
+    // before it ever reached a real holder — discovery censorship, not just a wasted dial. The
+    // filter must therefore apply BEFORE the early-exit decision: the lookup must run to
+    // convergence and report no providers.
+    let wanted = ContentId::store([0xA1; 32]);
+    let off_by_one_key = {
+        // A key differing from the queried one in a single nibble — the guard is an equality
+        // check, so a near-miss must be rejected exactly like an unrelated key.
+        let mut hex = wanted.to_key().to_hex();
+        let last = hex.pop().unwrap();
+        hex.push(if last == '0' { '1' } else { '0' });
+        hex
+    };
+
+    let seeker = seeker_against_stamping_peer(off_by_one_key).await;
+    assert!(
+        seeker.find_providers(&wanted).await.unwrap().is_empty(),
+        "a near-miss content_key is still not the queried key"
+    );
+}
