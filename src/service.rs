@@ -22,12 +22,12 @@
 //! to inbound DHT streams and gives the service a transport that dials outbound.
 
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use tokio::sync::Mutex;
 
 use dig_nat::PeerId;
 
+use crate::clock::now_secs;
 use crate::config::DhtConfig;
 use crate::content::ContentId;
 use crate::error::DhtError;
@@ -196,6 +196,8 @@ impl DhtService {
         // Merge local + discovered, dedup by provider, drop expired. Discovered records come
         // straight off the wire from other peers' responses, bypassing `ProviderRecord::new`'s
         // address cap — capped here before handing them back to our caller (SPEC §5.5, §14).
+        // Records for a key we did not query were already discarded at the wire boundary in
+        // `run_lookup`'s query closure (SPEC §6.7), so every record here is for `target`.
         let mut discovered = result.providers;
         for r in &mut discovered {
             crate::record::sort_and_cap_addresses(&mut r.addresses);
@@ -508,10 +510,13 @@ impl DhtService {
     async fn admit_verified_record(&self, mut record: ProviderRecord) -> PutOutcome {
         crate::record::sort_and_cap_addresses(&mut record.addresses);
 
-        let clamp_ceiling = now_secs().saturating_add(self.config.provider_ttl_secs());
+        let now = now_secs();
+        let clamp_ceiling = now.saturating_add(self.config.provider_ttl_secs());
         record.expires_at = record.expires_at.min(clamp_ceiling);
 
-        let outcome = self.providers.lock().await.put(record.clone());
+        // `put_at` with the SAME instant the clamp used, so admission cannot reclaim a slot it
+        // considers expired while the clamp considered it live (or vice versa).
+        let outcome = self.providers.lock().await.put_at(record.clone(), now);
         if outcome == PutOutcome::Accepted {
             if let Some(pid) = record.provider_peer_id() {
                 let contact = Contact::new(&pid, record.addresses.clone());
@@ -555,9 +560,29 @@ impl DhtService {
             let content_key = content_key.clone();
             let from = from.clone();
             async move {
-                let req = DhtRequest::FindProviders { content_key };
+                let req = DhtRequest::FindProviders {
+                    content_key: content_key.clone(),
+                };
                 match transport.rpc(&from, &contact, &req).await {
-                    Ok(DhtResponse::Providers { providers, closer }) => {
+                    Ok(DhtResponse::Providers {
+                        mut providers,
+                        closer,
+                    }) => {
+                        // Answer-to-question binding (SPEC §6.7, §14): keep only records for the
+                        // key we actually asked about. A responder is free to say ANYTHING here —
+                        // `ProviderRecord` carries no signature and the peer is not the record's
+                        // subject — so without this equality check any peer on the lookup path
+                        // could stamp arbitrary provider peer_ids and address hints onto records
+                        // for keys the finder never queried, and the finder would return them to
+                        // its caller as dial targets (dial fan-out / wasted-dial DoS, and a
+                        // spirit-defeat of the #1490 amplification bound).
+                        //
+                        // Filtering HERE, at the wire boundary, rather than at the final merge is
+                        // load-bearing: the lookup's `stop_on_providers` early exit fires as soon
+                        // as any provider is collected, so a mismatched record counted as "found"
+                        // would end the walk before it reached a real holder — discovery
+                        // censorship. Nothing downstream of this point sees an off-key record.
+                        providers.retain(|r| r.content_key == content_key);
                         Ok(QueryOutcome { closer, providers })
                     }
                     Ok(DhtResponse::Nodes { nodes }) => Ok(QueryOutcome {
@@ -652,13 +677,6 @@ impl DhtService {
 }
 
 /// Current wall-clock Unix seconds (saturating to 0 before the epoch), for provider TTLs.
-fn now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-}
-
 /// Parse a 64-hex string into a [`Key`] (used on the serving side for wire targets).
 fn parse_key(hex: &str) -> Option<Key> {
     hex64_to_bytes(hex).map(Key::from_bytes)

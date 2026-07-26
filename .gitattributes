@@ -1,0 +1,3 @@
+# Keep every text file LF in the repo, on every platform, so a Windows checkout cannot
+# reintroduce CRLF and turn a small change into a whole-file diff.
+* text=auto eol=lf

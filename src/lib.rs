@@ -43,6 +43,10 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+/// The crate's single wall-clock source (see [`clock`] — internal, so `now` stays a parameter on
+/// every decision point that must be testable).
+mod clock;
+
 pub mod config;
 pub mod content;
 pub mod error;
@@ -59,7 +63,10 @@ pub use config::DhtConfig;
 pub use content::ContentId;
 pub use error::DhtError;
 pub use key::{Distance, Key};
-pub use record::{AddressKind, CandidateAddr, ProviderRecord, MAX_ADDRESSES_PER_RECORD};
+pub use record::{
+    dial_candidates, AddressKind, CandidateAddr, ProviderRecord, MAX_ADDRESSES_PER_RECORD,
+    MAX_DIAL_CANDIDATES,
+};
 pub use routing::{Contact, RoutingTable};
 pub use service::{BootstrapPeer, DhtService};
 pub use transport::DhtTransport;
