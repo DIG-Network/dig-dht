@@ -34,9 +34,9 @@ use crate::record::ProviderRecord;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProviderStoreLimits {
     /// Maximum distinct provider records kept **per content key**. When a `put` for a new provider
-    /// would exceed this, an existing record is evicted to make room — the soonest-to-expire one
-    /// among the key's NEWEST slots, leaving its longest-established providers reserved
-    /// (see [`ProviderStore::eviction_victim`]).
+    /// would exceed this, an existing record is evicted to make room: an EXPIRED record if the key
+    /// holds one, otherwise the soonest-to-expire among the key's NEWEST slots, leaving its
+    /// longest-established LIVE providers reserved (see [`ProviderStore::eviction_victim`]).
     pub max_providers_per_key: usize,
     /// Maximum total records across **all** content keys. When a `put` for a genuinely new
     /// (content_key, provider) pair would exceed this, the request is rejected outright (no
@@ -142,6 +142,19 @@ impl ProviderStore {
     ///
     /// [`eviction_victim`]: Self::eviction_victim
     pub fn put(&mut self, record: ProviderRecord) -> PutOutcome {
+        self.put_at(record, crate::clock::now_secs())
+    }
+
+    /// [`put`](Self::put) with an explicit `now` (absolute Unix seconds) — the same admission
+    /// decision, taking the caller's clock instead of reading the system one.
+    ///
+    /// `now` is what lets eviction tell a LIVE provider from an expired one, which is the difference
+    /// between reclaiming a dead slot and evicting a real holder (see [`eviction_victim`]). A caller
+    /// that already has a timestamp — the serving side computes one for the TTL clamp — SHOULD pass
+    /// it, so the clamp and the admission decision are made against a single instant.
+    ///
+    /// [`eviction_victim`]: Self::eviction_victim
+    pub fn put_at(&mut self, record: ProviderRecord, now: u64) -> PutOutcome {
         if let Some(existing) = self
             .by_key
             .get_mut(&record.content_key)
@@ -162,7 +175,7 @@ impl ProviderStore {
         if let Some(providers) = self.by_key.get_mut(&record.content_key) {
             if providers.len() >= self.limits.max_providers_per_key {
                 let Some(evict_id) =
-                    Self::eviction_victim(providers, self.limits.max_providers_per_key)
+                    Self::eviction_victim(providers, self.limits.max_providers_per_key, now)
                 else {
                     // Every slot is established — admitting would breach the per-key cap, so the
                     // cap wins. Unreachable while the floor stays a strict fraction of the cap; kept
@@ -199,21 +212,53 @@ impl ProviderStore {
     /// content undiscoverable through this node. Repeated across the k-closest nodes that is
     /// network-wide censorship of a key.
     ///
-    /// **The policy.** The `max_providers_per_key / ESTABLISHED_FLOOR_DIVISOR` longest-established
-    /// providers of a key are RESERVED and never evicted; eviction chooses among the newest slots
-    /// (the churn zone), still preferring the soonest-to-expire there because that record is the
-    /// least valuable to keep. This mirrors the k-bucket policy this crate already applies to
-    /// contacts — long-lived entries resist eviction attacks — and bounds what a flood can achieve:
-    /// an attacker can churn the unreserved slots at will but cannot displace a holder that was
-    /// already established, no matter how many identities it spends or how it times its expiries.
-    /// Ties break on `admitted_seq` so the choice is deterministic rather than hash-order dependent.
+    /// **The policy, in two steps.**
+    ///
+    /// 1. **An EXPIRED record is the victim, wherever it sits — the floor included.** A record past
+    ///    its `expires_at` is already invisible to [`get`](Self::get) and merely awaits the next
+    ///    [`gc`](Self::gc), so reclaiming its slot costs nothing. Liveness therefore OUTRANKS
+    ///    establishment. Were the floor allowed to protect a dead record, a live holder in the churn
+    ///    zone would be evicted to keep a corpse — and that needs no attacker, because a node's GC
+    ///    tick is coarser than the provider TTL: a key whose earliest providers have gone offline
+    ///    (ordinary churn — shutdown, cache eviction) carries expired records inside its floor for a
+    ///    whole GC period, and during that window every new announcement would evict a LIVE
+    ///    provider, making a capsule LESS discoverable the more holders announce it. That is the
+    ///    replication flywheel running backwards.
+    /// 2. **Otherwise every record is live, and the establishment floor governs.** The
+    ///    `max_providers_per_key / ESTABLISHED_FLOOR_DIVISOR` longest-established providers are
+    ///    RESERVED; the victim is the soonest-to-expire among the newest slots (the churn zone),
+    ///    that being the least valuable LIVE record to keep. This mirrors the k-bucket policy this
+    ///    crate already applies to contacts — long-lived entries resist eviction attacks — and
+    ///    bounds what a flood can achieve: an attacker may churn the unreserved slots at will but
+    ///    cannot displace an ALREADY-ESTABLISHED holder, however many identities it spends or
+    ///    however it times its expiries.
+    ///
+    /// Ties break on `admitted_seq` in both steps, so the choice is deterministic rather than
+    /// hash-order dependent.
+    ///
+    /// **Residual, NOT closed here.** The floor protects an incumbent, not a latecomer: an attacker
+    /// that establishes BEFORE the honest holder retains the full pre-#1434 eviction primitive, and
+    /// because this store is in-memory only, every restart resets the floor to first-come. See the
+    /// caveat in `SPEC.md` §6.3/§14 — closing it needs signed provider records (#1573).
     fn eviction_victim(
         providers: &HashMap<String, ProviderEntry>,
         max_providers_per_key: usize,
+        now: u64,
     ) -> Option<String> {
-        let established_floor = max_providers_per_key / ESTABLISHED_FLOOR_DIVISOR;
         let mut by_establishment: Vec<&ProviderEntry> = providers.values().collect();
         by_establishment.sort_by_key(|e| e.admitted_seq);
+
+        // Step 1 — reclaim a dead slot in preference to ANY live record, the floor included.
+        let expired = by_establishment
+            .iter()
+            .filter(|e| e.record.is_expired(now))
+            .min_by_key(|e| (e.record.expires_at, e.admitted_seq));
+        if let Some(dead) = expired {
+            return Some(dead.record.provider_peer_id.clone());
+        }
+
+        // Step 2 — every record is live: reserve the established floor, evict inside the churn zone.
+        let established_floor = max_providers_per_key / ESTABLISHED_FLOOR_DIVISOR;
         by_establishment
             .into_iter()
             .skip(established_floor)
@@ -303,6 +348,11 @@ mod tests {
     use crate::key::Key;
     use crate::record::CandidateAddr;
     use dig_nat::PeerId;
+
+    /// The instant the eviction tests reason at. Every `expires_at` they use is in the FUTURE
+    /// relative to this, so their records are LIVE and the assertions are about establishment —
+    /// not about a record that had silently already expired.
+    const NOW: u64 = 0;
 
     fn rec(content: &Key, provider: u8, expires_at: u64) -> ProviderRecord {
         ProviderRecord::new(
@@ -394,11 +444,11 @@ mod tests {
             max_total_records: 1000,
         });
         let key = Key::from_bytes([0xAA; 32]);
-        assert_eq!(s.put(rec(&key, 1, 100)), PutOutcome::Accepted); // established
-        assert_eq!(s.put(rec(&key, 2, 200)), PutOutcome::Accepted); // established
-        assert_eq!(s.put(rec(&key, 3, 900)), PutOutcome::Accepted); // churn zone
-        assert_eq!(s.put(rec(&key, 4, 800)), PutOutcome::Accepted); // churn zone, expires sooner
-        assert_eq!(s.put(rec(&key, 5, 999)), PutOutcome::Accepted);
+        assert_eq!(s.put_at(rec(&key, 1, 100), NOW), PutOutcome::Accepted); // established
+        assert_eq!(s.put_at(rec(&key, 2, 200), NOW), PutOutcome::Accepted); // established
+        assert_eq!(s.put_at(rec(&key, 3, 900), NOW), PutOutcome::Accepted); // churn zone
+        assert_eq!(s.put_at(rec(&key, 4, 800), NOW), PutOutcome::Accepted); // churn zone, expires sooner
+        assert_eq!(s.put_at(rec(&key, 5, 999), NOW), PutOutcome::Accepted);
         assert_eq!(
             s.get(&key.to_hex(), 0).len(),
             4,
@@ -434,7 +484,7 @@ mod tests {
         });
         let key = Key::from_bytes([0xAA; 32]);
         let honest = PeerId::from_bytes([1u8; 32]).to_hex();
-        assert_eq!(s.put(rec(&key, 1, 100)), PutOutcome::Accepted);
+        assert_eq!(s.put_at(rec(&key, 1, 100), NOW), PutOutcome::Accepted);
 
         // A sustained flood of distinct Sybil providers, each expiring strictly later than the last
         // — the worst case for expiry-ordered eviction.
@@ -445,7 +495,7 @@ mod tests {
                 vec![CandidateAddr::direct("h", 9444)],
                 1_000 + i,
             );
-            s.put(sybil);
+            s.put_at(sybil, NOW);
         }
 
         assert!(
@@ -470,11 +520,11 @@ mod tests {
         let key = Key::from_bytes([0xAA; 32]);
         // Established slots deliberately hold the SOONEST expiries — under the old policy they
         // would have been evicted first.
-        s.put(rec(&key, 1, 10));
-        s.put(rec(&key, 2, 20));
-        s.put(rec(&key, 3, 900));
-        s.put(rec(&key, 4, 800));
-        s.put(rec(&key, 5, 999));
+        s.put_at(rec(&key, 1, 10), NOW);
+        s.put_at(rec(&key, 2, 20), NOW);
+        s.put_at(rec(&key, 3, 900), NOW);
+        s.put_at(rec(&key, 4, 800), NOW);
+        s.put_at(rec(&key, 5, 999), NOW);
 
         let live = live_provider_ids(&s, &key);
         assert!(
@@ -498,23 +548,134 @@ mod tests {
         });
         let key = Key::from_bytes([0xAA; 32]);
         let honest = PeerId::from_bytes([1u8; 32]).to_hex();
-        s.put(rec(&key, 1, 100));
+        s.put_at(rec(&key, 1, 100), NOW);
         for i in 0..3u64 {
-            s.put(rec(&key, 10 + i as u8, 500 + i));
+            s.put_at(rec(&key, 10 + i as u8, 500 + i), NOW);
         }
-        s.put(rec(&key, 1, 5_000)); // the honest holder republishes
+        s.put_at(rec(&key, 1, 5_000), NOW); // the honest holder republishes
         for i in 0..50u64 {
-            s.put(ProviderRecord::new(
-                &key,
-                &PeerId::from_bytes(sybil_id(i)),
-                vec![CandidateAddr::direct("h", 9444)],
-                9_000 + i,
-            ));
+            s.put_at(
+                ProviderRecord::new(
+                    &key,
+                    &PeerId::from_bytes(sybil_id(i)),
+                    vec![CandidateAddr::direct("h", 9444)],
+                    9_000 + i,
+                ),
+                NOW,
+            );
         }
         assert!(
             live_provider_ids(&s, &key).contains(&honest),
             "a republished record keeps its establishment"
         );
+    }
+
+    // ---- Liveness outranks establishment (#1434 follow-up) ----
+
+    #[test]
+    fn an_expired_record_in_the_floor_is_evicted_before_a_live_one() {
+        // The pre-#1434 policy evicted the soonest-to-expire record, so an EXPIRED record was always
+        // the first victim. The establishment floor must not invert that: a dead record inside the
+        // reserved floor cannot outrank a live provider in the churn zone. Without a liveness check
+        // this needs NO attacker — a node's GC tick is coarser than the provider TTL, so whenever the
+        // earliest-admitted half of a key goes offline, every new announcement for that key evicts a
+        // LIVE holder and announcing more holders makes the capsule LESS discoverable.
+        let mut s = ProviderStore::with_limits(ProviderStoreLimits {
+            max_providers_per_key: 4,
+            max_total_records: 1000,
+        });
+        let key = Key::from_bytes([0xAA; 32]);
+        let now = 10_000;
+        // The reserved floor (seq 0, 1) is long expired...
+        s.put_at(rec(&key, 1, 100), now);
+        s.put_at(rec(&key, 2, 200), now);
+        // ...while the churn zone (seq 2, 3) holds two LIVE honest providers.
+        s.put_at(rec(&key, 3, now + 5_000), now);
+        s.put_at(rec(&key, 4, now + 6_000), now);
+
+        s.put_at(rec(&key, 5, now + 7_000), now);
+
+        let live = live_provider_ids_at(&s, &key, now);
+        assert!(
+            live.contains(&PeerId::from_bytes([3u8; 32]).to_hex())
+                && live.contains(&PeerId::from_bytes([4u8; 32]).to_hex()),
+            "both LIVE providers must survive; an expired record in the floor is the victim"
+        );
+    }
+
+    #[test]
+    fn one_expired_record_anywhere_is_the_victim_before_any_live_record() {
+        // The one-off variant: exactly ONE expired record, sitting inside the reserved floor, with
+        // every other slot live. It must still be the one evicted.
+        let mut s = ProviderStore::with_limits(ProviderStoreLimits {
+            max_providers_per_key: 4,
+            max_total_records: 1000,
+        });
+        let key = Key::from_bytes([0xAA; 32]);
+        let now = 10_000;
+        s.put_at(rec(&key, 1, 100), now); // expired, seq 0 → inside the floor
+        s.put_at(rec(&key, 2, now + 1_000), now);
+        s.put_at(rec(&key, 3, now + 2_000), now);
+        s.put_at(rec(&key, 4, now + 3_000), now);
+
+        s.put_at(rec(&key, 5, now + 4_000), now);
+
+        assert_eq!(
+            live_provider_ids_at(&s, &key, now).len(),
+            4,
+            "reclaiming the dead slot leaves every live provider intact"
+        );
+    }
+
+    #[test]
+    fn the_floor_still_protects_an_established_holder_when_every_record_is_live() {
+        // Liveness must take precedence WITHOUT weakening #1434: with no dead slot to reclaim, the
+        // establishment floor governs again and a sustained flood cannot displace the incumbent.
+        let mut s = ProviderStore::with_limits(ProviderStoreLimits {
+            max_providers_per_key: 20,
+            max_total_records: 100_000,
+        });
+        let key = Key::from_bytes([0xAA; 32]);
+        let now = 10_000;
+        let honest = PeerId::from_bytes([1u8; 32]).to_hex();
+        s.put_at(rec(&key, 1, now + 1_000), now);
+        for i in 0..500u64 {
+            s.put_at(
+                ProviderRecord::new(
+                    &key,
+                    &PeerId::from_bytes(sybil_id(i)),
+                    vec![CandidateAddr::direct("h", 9444)],
+                    now + 2_000 + i,
+                ),
+                now,
+            );
+        }
+        assert!(
+            live_provider_ids_at(&s, &key, now).contains(&honest),
+            "an all-live key keeps the #1434 protection"
+        );
+    }
+
+    #[test]
+    fn put_delegates_to_put_at_with_the_wall_clock() {
+        // `put` is the compatibility wrapper (its signature is public API): same admission decision,
+        // with `now` read from the system clock.
+        let mut wall = ProviderStore::new();
+        let key = Key::from_bytes([0xAA; 32]);
+        assert_eq!(wall.put(rec(&key, 1, u64::MAX)), PutOutcome::Accepted);
+        assert_eq!(wall.len(), 1);
+    }
+
+    /// The live provider peer_ids for `key` as of `now`.
+    fn live_provider_ids_at(
+        s: &ProviderStore,
+        key: &Key,
+        now: u64,
+    ) -> std::collections::HashSet<String> {
+        s.get(&key.to_hex(), now)
+            .into_iter()
+            .map(|r| r.provider_peer_id)
+            .collect()
     }
 
     /// A distinct Sybil peer_id per index (varying the high bytes so ids stay distinct past 255).

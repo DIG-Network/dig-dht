@@ -43,6 +43,10 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+/// The crate's single wall-clock source (see [`clock`] — internal, so `now` stays a parameter on
+/// every decision point that must be testable).
+mod clock;
+
 pub mod config;
 pub mod content;
 pub mod error;

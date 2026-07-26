@@ -22,7 +22,6 @@
 //! to inbound DHT streams and gives the service a transport that dials outbound.
 
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use tokio::sync::Mutex;
 
@@ -32,6 +31,7 @@ use crate::config::DhtConfig;
 use crate::content::ContentId;
 use crate::error::DhtError;
 use crate::key::Key;
+use crate::clock::now_secs;
 use crate::lookup::{iterative_find, QueryOutcome};
 use crate::provider_store::{ProviderStore, PutOutcome};
 use crate::record::{CandidateAddr, ProviderRecord};
@@ -510,10 +510,13 @@ impl DhtService {
     async fn admit_verified_record(&self, mut record: ProviderRecord) -> PutOutcome {
         crate::record::sort_and_cap_addresses(&mut record.addresses);
 
-        let clamp_ceiling = now_secs().saturating_add(self.config.provider_ttl_secs());
+        let now = now_secs();
+        let clamp_ceiling = now.saturating_add(self.config.provider_ttl_secs());
         record.expires_at = record.expires_at.min(clamp_ceiling);
 
-        let outcome = self.providers.lock().await.put(record.clone());
+        // `put_at` with the SAME instant the clamp used, so admission cannot reclaim a slot it
+        // considers expired while the clamp considered it live (or vice versa).
+        let outcome = self.providers.lock().await.put_at(record.clone(), now);
         if outcome == PutOutcome::Accepted {
             if let Some(pid) = record.provider_peer_id() {
                 let contact = Contact::new(&pid, record.addresses.clone());
@@ -674,13 +677,6 @@ impl DhtService {
 }
 
 /// Current wall-clock Unix seconds (saturating to 0 before the epoch), for provider TTLs.
-fn now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-}
-
 /// Parse a 64-hex string into a [`Key`] (used on the serving side for wire targets).
 fn parse_key(hex: &str) -> Option<Key> {
     hex64_to_bytes(hex).map(Key::from_bytes)
