@@ -108,6 +108,34 @@ impl CandidateAddr {
         }
     }
 
+    /// The identity of the ENDPOINT this candidate names, for deduplication: the parsed address in
+    /// canonical form plus the port, falling back to the raw host text when it is not an IP literal.
+    ///
+    /// Deduplicating on the raw `host` string would treat one address spelled several ways as several
+    /// dial targets — `2001:db8::1`, `2001:0db8::1`, `2001:db8:0:0:0:0:0:1` and `2001:DB8::1` are the
+    /// same host — which lets a padded record consume every slot of the dial set with a single
+    /// address. Parsing first collapses those spellings, and an IPv4-mapped IPv6 literal is reduced to
+    /// its IPv4 form so `::ffff:a.b.c.d` and `a.b.c.d` are recognised as one endpoint (consistent with
+    /// [`Family::of`] classifying both as IPv4 reachability).
+    fn dial_identity(&self) -> (String, u16) {
+        let host = match self.host.parse::<IpAddr>() {
+            Ok(IpAddr::V6(v6)) => v6
+                .to_ipv4_mapped()
+                .map(IpAddr::V4)
+                .unwrap_or(IpAddr::V6(v6))
+                .to_string(),
+            Ok(ip) => ip.to_string(),
+            Err(_) => self.host.clone(),
+        };
+        (host, self.port)
+    }
+
+    /// Whether this candidate is a genuine IPv6 literal — the tier that is tried FIRST and, being
+    /// the preferred tier, the one that can crowd every other out of a capped dial set.
+    fn is_ipv6_literal(&self) -> bool {
+        self.family_rank() == 0
+    }
+
     /// Sort key for IPv6-first, then most-direct-first ordering: `(family_rank, kind_rank)`. The
     /// family half comes from [`dig_ip::Family`] (see [`family_rank`](Self::family_rank)); the
     /// dht-specific directness tiebreak stays [`AddressKind::rank`], so within one family the most
@@ -174,9 +202,41 @@ pub fn dial_candidates(addresses: &[CandidateAddr]) -> Vec<&CandidateAddr> {
     // list is constructed or deserialized, but `addresses` is a public field any caller may rewrite.
     candidates.sort_by_key(|a| a.family_then_kind_rank());
     let mut seen = std::collections::HashSet::new();
-    candidates.retain(|a| seen.insert((a.host.as_str(), a.port)));
-    candidates.truncate(MAX_DIAL_CANDIDATES);
+    candidates.retain(|a| seen.insert(a.dial_identity()));
+    reserve_fallback_slot_and_cap(&mut candidates);
     candidates
+}
+
+/// Truncate `candidates` to [`MAX_DIAL_CANDIDATES`] while KEEPING the fallback tier represented.
+///
+/// Truncating the family-sorted list outright would let the preferred tier fill the cap on its own: a
+/// holder advertising four or more IPv6 candidates would yield a dial set containing no IPv4 at all,
+/// so a dialer that faithfully walked every candidate it was given would STILL never reach the working
+/// address — precisely the #836 read-leg failure this iterator exists to prevent, and a violation of
+/// the rule that a failed IPv6 attempt must never mask a working IPv4 one. It needs no attacker: a
+/// dual-stack holder legitimately emits direct + mapped + reflexive IPv6 candidates, and an IPv6
+/// address with no working route is ordinary.
+///
+/// So when the cap would exclude EVERY non-IPv6 candidate and one exists, the least-preferred kept
+/// slot is given to the best non-IPv6 candidate. IPv6 still leads the list — the reservation costs one
+/// surplus IPv6 attempt, never the ordering.
+fn reserve_fallback_slot_and_cap(candidates: &mut Vec<&CandidateAddr>) {
+    if candidates.len() <= MAX_DIAL_CANDIDATES {
+        return;
+    }
+    let kept_excludes_every_fallback = candidates[..MAX_DIAL_CANDIDATES]
+        .iter()
+        .all(|a| a.is_ipv6_literal());
+    let fallback = kept_excludes_every_fallback
+        .then(|| candidates.iter().find(|a| !a.is_ipv6_literal()).copied())
+        .flatten();
+    match fallback {
+        Some(fallback) => {
+            candidates.truncate(MAX_DIAL_CANDIDATES - 1);
+            candidates.push(fallback);
+        }
+        None => candidates.truncate(MAX_DIAL_CANDIDATES),
+    }
 }
 
 /// serde hook applied to every `addresses` field ([`ProviderRecord`], [`crate::routing::Contact`]),
@@ -685,5 +745,97 @@ mod tests {
         ]);
         let hosts: Vec<&str> = rec.addresses.iter().map(|a| a.host.as_str()).collect();
         assert_eq!(hosts, vec!["203.0.113.7", "not-a-literal"]);
+    }
+
+    #[test]
+    fn dial_candidates_reserve_a_slot_for_the_ipv4_fallback() {
+        // #836 again, one layer down: truncating to MAX_DIAL_CANDIDATES *after* the family sort means
+        // a record carrying four or more IPv6 candidates yields a dial set with ZERO IPv4 — so a
+        // dialer walking every candidate it is given still never reaches the working address. That
+        // contradicts the SPEC 5.5 MUST that a failed IPv6 attempt never masks a working IPv4 one.
+        // A dual-stack holder legitimately emits direct + mapped + reflexive v6, so this is reachable
+        // without an attacker; an IPv6 address with no working route is the common AWS case.
+        let rec = record_with(vec![
+            CandidateAddr::direct("2001:db8::1", 9444),
+            CandidateAddr::direct("2001:db8::2", 9444),
+            CandidateAddr::direct("2001:db8::3", 9444),
+            CandidateAddr::direct("2001:db8::4", 9444),
+            CandidateAddr::direct("203.0.113.7", 9444),
+        ]);
+        let candidates = rec.dial_candidates();
+        assert_eq!(candidates.len(), MAX_DIAL_CANDIDATES);
+        assert!(
+            candidates.iter().any(|a| a.host == "203.0.113.7"),
+            "the IPv4 fallback tier must keep a slot inside the cap, got {:?}",
+            candidates.iter().map(|a| &a.host).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            candidates[0].host, "2001:db8::1",
+            "IPv6 still leads — the reservation costs the LEAST preferred v6 slot, not the order"
+        );
+    }
+
+    #[test]
+    fn dial_candidates_reserve_the_fallback_only_when_it_would_be_lost() {
+        // The one-off variant either side of the cap: at exactly the cap nothing is dropped and no
+        // reservation is needed, so a v4 that already fits must not be promoted out of order.
+        let rec = record_with(vec![
+            CandidateAddr::direct("2001:db8::1", 9444),
+            CandidateAddr::direct("2001:db8::2", 9444),
+            CandidateAddr::direct("2001:db8::3", 9444),
+            CandidateAddr::direct("203.0.113.7", 9444),
+        ]);
+        let hosts: Vec<&str> = rec
+            .dial_candidates()
+            .iter()
+            .map(|a| a.host.as_str())
+            .collect();
+        assert_eq!(
+            hosts,
+            vec!["2001:db8::1", "2001:db8::2", "2001:db8::3", "203.0.113.7"]
+        );
+    }
+
+    #[test]
+    fn dial_candidates_dedupe_equivalent_spellings_of_one_address() {
+        // Dedup on the RAW host string lets one address spelled four ways consume every slot, which
+        // is the fallback-starvation above with no distinct addresses at all. Equivalence is a
+        // property of the parsed IpAddr, not of the text.
+        let rec = record_with(vec![
+            CandidateAddr::direct("2001:db8::1", 9444),
+            CandidateAddr::direct("2001:0db8::1", 9444),
+            CandidateAddr::direct("2001:db8:0:0:0:0:0:1", 9444),
+            CandidateAddr::direct("2001:DB8::1", 9444),
+            CandidateAddr::direct("203.0.113.7", 9444),
+        ]);
+        let candidates = rec.dial_candidates();
+        assert_eq!(
+            candidates.len(),
+            2,
+            "four spellings of one IPv6 address are ONE dial attempt, got {:?}",
+            candidates.iter().map(|a| &a.host).collect::<Vec<_>>()
+        );
+        assert!(candidates.iter().any(|a| a.host == "203.0.113.7"));
+    }
+
+    #[test]
+    fn dial_candidates_treat_a_v4_mapped_spelling_as_the_same_address_as_its_ipv4() {
+        // `::ffff:a.b.c.d` and `a.b.c.d` are the same endpoint and the same IPv4 reachability (which
+        // is why `dig_ip::Family` ranks both V4), so they are one dial attempt, not two.
+        let rec = record_with(vec![
+            CandidateAddr::direct("::ffff:203.0.113.7", 9444),
+            CandidateAddr::direct("203.0.113.7", 9444),
+        ]);
+        assert_eq!(rec.dial_candidates().len(), 1);
+    }
+
+    #[test]
+    fn dial_candidates_keep_distinct_ports_of_one_host_apart() {
+        // Dedup is per ENDPOINT: the same host on two ports is two genuine dial targets.
+        let rec = record_with(vec![
+            CandidateAddr::direct("2001:db8::1", 9444),
+            CandidateAddr::direct("2001:db8::1", 9445),
+        ]);
+        assert_eq!(rec.dial_candidates().len(), 2);
     }
 }
