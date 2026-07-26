@@ -894,19 +894,36 @@ async fn withdraw_provider_stops_republish() {
 
 // ---- A queried peer's answer is untrusted input (#1621) ---------------------------------------
 
-/// A single-peer transport whose responder answers **every** `find_providers` with one provider
-/// record stamped with `answer_content_key`, regardless of which key was actually asked for.
+/// Which `content_key` a canned answer stamps onto the record it returns.
+enum StampedKey {
+    /// Answer truthfully — stamp the key the finder actually asked for.
+    Queried,
+    /// Stamp this key regardless of what was asked (the lie when it is not the queried key).
+    Fixed(String),
+}
+
+/// One peer's canned `find_providers` answer: a single provider record plus the `closer` contacts
+/// that carry the walk to its next hop.
+struct CannedAnswer {
+    /// The `content_key` the returned record carries.
+    stamped_key: StampedKey,
+    /// The `peer_id` the returned record names as the holder.
+    provider: PeerId,
+    /// Contacts returned as `closer` — how a lying peer can still refer the finder onward.
+    closer: Vec<Contact>,
+}
+
+/// A transport that answers each peer's `find_providers` from a canned script — the misbehaviour
+/// double for #1621.
 ///
-/// This is the misbehaviour double for #1621. It is deliberately parameterized on the stamped key
-/// rather than hard-wired to a mismatching one, so the SAME double expresses both the lie (a record
-/// for a key the finder never asked about) and the truth (a record for the queried key). A double
-/// that could only ever lie would leave "the filter drops everything" indistinguishable from "the
-/// filter works".
+/// It is parameterized on the stamped key rather than hard-wired to a mismatching one, so the SAME
+/// double expresses both the lie (a record for a key the finder never asked about) and the truth (a
+/// record for the queried key), and can place a genuine holder BEHIND a lying peer. A double that
+/// could only ever lie would leave "the filter drops everything" indistinguishable from "the filter
+/// works", and one that could not refer onward could not reach the walk's next hop at all.
 struct StampingTransport {
-    /// The `content_key` every answered record carries.
-    answer_content_key: String,
-    /// The `peer_id` every answered record names as the holder.
-    answer_provider: PeerId,
+    /// peer_id (64-hex) → that peer's canned answer. A peer with no script is unreachable.
+    answers: HashMap<String, CannedAnswer>,
 }
 
 #[async_trait]
@@ -914,23 +931,46 @@ impl DhtTransport for StampingTransport {
     async fn rpc(
         &self,
         _from: &Contact,
-        _peer: &Contact,
+        peer: &Contact,
         request: &DhtRequest,
     ) -> Result<DhtResponse, DhtError> {
+        let Some(answer) = self.answers.get(&peer.peer_id) else {
+            return Err(DhtError::transport("no route"));
+        };
         match request {
-            DhtRequest::FindProviders { .. } => Ok(DhtResponse::Providers {
+            DhtRequest::FindProviders { content_key } => Ok(DhtResponse::Providers {
                 providers: vec![dig_dht::ProviderRecord {
-                    content_key: self.answer_content_key.clone(),
-                    provider_peer_id: self.answer_provider.to_hex(),
+                    content_key: match &answer.stamped_key {
+                        StampedKey::Queried => content_key.clone(),
+                        StampedKey::Fixed(key) => key.clone(),
+                    },
+                    provider_peer_id: answer.provider.to_hex(),
                     addresses: addr(),
                     expires_at: u64::MAX,
                 }],
-                closer: vec![],
+                closer: answer.closer.clone(),
             }),
             DhtRequest::Ping { nonce } => Ok(DhtResponse::Pong { nonce: *nonce }),
             _ => Err(DhtError::transport("unsupported in this harness")),
         }
     }
+}
+
+/// A seeker whose routing table holds exactly `known`, talking to a swarm scripted by `answers`.
+async fn scripted_seeker(
+    known: &[PeerId],
+    answers: HashMap<String, CannedAnswer>,
+) -> Arc<DhtService> {
+    let seeker = Arc::new(DhtService::new(
+        pid(0x11, 0x01),
+        addr(),
+        DhtConfig::default(),
+        Arc::new(StampingTransport { answers }),
+    ));
+    for peer in known {
+        seeker.add_peer(peer, addr()).await;
+    }
+    seeker
 }
 
 /// Build a lone seeker whose only known peer answers with records stamped `answer_content_key`.
@@ -941,8 +981,14 @@ async fn seeker_against_stamping_peer(answer_content_key: String) -> Arc<DhtServ
         addr(),
         DhtConfig::default(),
         Arc::new(StampingTransport {
-            answer_content_key,
-            answer_provider: responder,
+            answers: HashMap::from([(
+                responder.to_hex(),
+                CannedAnswer {
+                    stamped_key: StampedKey::Fixed(answer_content_key),
+                    provider: responder,
+                    closer: vec![],
+                },
+            )]),
         }),
     ));
     seeker.add_peer(&responder, addr()).await;
@@ -977,6 +1023,60 @@ async fn find_providers_keeps_records_for_exactly_the_queried_key() {
     let found = seeker.find_providers(&wanted).await.unwrap();
 
     assert_eq!(found.len(), 1, "a record for the queried key is kept");
+    assert_eq!(found[0].content_key, wanted.to_key().to_hex());
+}
+
+#[tokio::test]
+async fn a_lying_first_hop_does_not_hide_a_genuine_holder_further_along() {
+    // The DISCRIMINATING test for #1621: it pins WHERE the filter lives, not just what the caller
+    // ends up with. The three sibling tests above assert only that the returned set is empty, which
+    // a filter at the FINAL MERGE satisfies identically — yet at the merge point the walk has
+    // already early-exited on the off-key record (`lookup.rs`: `stop_on_providers &&
+    // !providers.is_empty()`), so a real holder one hop further along is never even queried. That is
+    // the censorship vector, and it is invisible to an outcome-only assertion.
+    //
+    // Topology: the seeker knows ONLY a lying first hop, which answers off-key but refers the walk
+    // onward (`closer`) to a genuine holder. Wire-boundary filtering discards the lie, the walk
+    // continues, and the holder IS returned. Merge-point filtering returns an empty set and fails
+    // here. Relocating the guard therefore breaks a test, which is the whole point.
+    let wanted = ContentId::store([0xA1; 32]);
+    let unrelated_key = ContentId::store([0xB2; 32]).to_key().to_hex();
+
+    let liar = pid(0xEE, 0x01);
+    let holder = pid(0xEE, 0x02);
+    let seeker = scripted_seeker(
+        &[liar],
+        HashMap::from([
+            (
+                liar.to_hex(),
+                CannedAnswer {
+                    stamped_key: StampedKey::Fixed(unrelated_key),
+                    provider: liar,
+                    // The lie is accompanied by a genuine referral, so the ONLY thing that can stop
+                    // the walk reaching the holder is the early exit the off-key record would trip.
+                    closer: vec![Contact::new(&holder, addr())],
+                },
+            ),
+            (
+                holder.to_hex(),
+                CannedAnswer {
+                    stamped_key: StampedKey::Queried,
+                    provider: holder,
+                    closer: vec![],
+                },
+            ),
+        ]),
+    )
+    .await;
+
+    let found = seeker.find_providers(&wanted).await.unwrap();
+
+    assert_eq!(
+        found.len(),
+        1,
+        "the genuine holder behind a lying hop must still be found, got {found:?}"
+    );
+    assert_eq!(found[0].provider_peer_id, holder.to_hex());
     assert_eq!(found[0].content_key, wanted.to_key().to_hex());
 }
 
