@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.6.0] - 2026-07-26
+
+### Features
+- **dht:** Harden the discovery path and add an ordered dial-candidate iterator (#13)
+
 ## [0.5.2] - 2026-07-24
 
 ### Features
