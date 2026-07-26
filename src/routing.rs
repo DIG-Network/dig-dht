@@ -28,10 +28,12 @@ use crate::record::{sort_and_cap_addresses, CandidateAddr};
 pub struct Contact {
     /// The peer's identity — 64-hex `peer_id = SHA-256(SPKI DER)`.
     pub peer_id: String,
-    /// Candidate addresses to reach the peer. Ordered IPv6-first, then most-direct-first by
-    /// [`AddressKind::rank`](crate::record::AddressKind::rank) when built via [`Contact::new`]; a
-    /// `Contact` deserialized directly from the wire (bypassing `new`) is not guaranteed sorted, so
-    /// a consumer that cannot assume a conforming producer should still sort defensively.
+    /// Candidate addresses to reach the peer, ordered IPv6-first then most-direct-first by
+    /// [`AddressKind::rank`](crate::record::AddressKind::rank) and bounded to
+    /// [`MAX_ADDRESSES_PER_RECORD`](crate::record::MAX_ADDRESSES_PER_RECORD) — held by BOTH
+    /// [`Contact::new`] and deserialization, so a contact off the wire carries the same guarantee
+    /// as a constructed one.
+    #[serde(deserialize_with = "crate::record::deserialize_capped_addresses")]
     pub addresses: Vec<CandidateAddr>,
 }
 
@@ -495,6 +497,23 @@ mod tests {
             .map(|i| CandidateAddr::direct(format!("203.0.113.{}", i % 255), 9444))
             .collect();
         let c = Contact::new(&pid([1u8; 32]), many);
+        assert_eq!(c.addresses.len(), crate::record::MAX_ADDRESSES_PER_RECORD);
+    }
+
+    #[test]
+    fn contact_deserialization_bounds_the_address_count() {
+        // #1514: a `Contact` off the wire is folded into the routing table AND re-served to every
+        // peer that queries us, so the address bound must hold at the decode boundary itself — not
+        // only at whichever ingest site remembered to cap it.
+        let addrs: Vec<String> = (0..1000)
+            .map(|i| format!(r#"{{"host":"198.51.100.{}","port":1,"kind":"relay"}}"#, i % 255))
+            .collect();
+        let json = format!(
+            r#"{{"peer_id":"{}","addresses":[{}]}}"#,
+            "cc".repeat(32),
+            addrs.join(",")
+        );
+        let c: Contact = serde_json::from_str(&json).unwrap();
         assert_eq!(c.addresses.len(), crate::record::MAX_ADDRESSES_PER_RECORD);
     }
 }

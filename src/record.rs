@@ -142,6 +142,29 @@ pub(crate) fn sort_and_cap_addresses(addresses: &mut Vec<CandidateAddr>) {
     addresses.truncate(MAX_ADDRESSES_PER_RECORD);
 }
 
+/// serde hook applied to every `addresses` field ([`ProviderRecord`], [`crate::routing::Contact`]),
+/// so [`MAX_ADDRESSES_PER_RECORD`] holds **by construction** for any value that is deserialized —
+/// from a peer's wire frame, a config file, or a cached snapshot — and not only at the ingest call
+/// sites that remember to call [`sort_and_cap_addresses`] (§14). Deserialization is the ONE
+/// unavoidable gate every untrusted address list passes through; enforcing the bound there means a
+/// future ingest path cannot silently reintroduce an unbounded list.
+///
+/// It **bounds rather than rejects**: a list longer than the cap is sorted and truncated, never
+/// turned into a decode error. Rejecting would make a nonconforming (or simply older, looser)
+/// producer's record unparseable, which the store-format compatibility rule forbids — and would
+/// hand a peer an easy way to poison a whole frame. Sorting before truncating keeps the
+/// most-preferred candidates, so a hostile peer cannot bury the one reachable address behind filler.
+pub(crate) fn deserialize_capped_addresses<'de, D>(
+    deserializer: D,
+) -> Result<Vec<CandidateAddr>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let mut addresses = Vec::<CandidateAddr>::deserialize(deserializer)?;
+    sort_and_cap_addresses(&mut addresses);
+    Ok(addresses)
+}
+
 /// The DHT's stored value: peer `provider_peer_id` holds the content whose key is `content_key`,
 /// reachable at `addresses`, until `expires_at`.
 ///
@@ -159,10 +182,11 @@ pub struct ProviderRecord {
     pub content_key: String,
     /// The holder's `peer_id` (64-hex).
     pub provider_peer_id: String,
-    /// Candidate addresses to reach the holder. Ordered IPv6-first, then most-direct-first by
-    /// [`AddressKind::rank`] when built via [`ProviderRecord::new`]; a record deserialized directly
-    /// from the wire (bypassing `new`) is not guaranteed sorted, so a consumer that cannot assume a
-    /// conforming producer should still sort defensively.
+    /// Candidate addresses to reach the holder, ordered IPv6-first then most-direct-first by
+    /// [`AddressKind::rank`] and bounded to [`MAX_ADDRESSES_PER_RECORD`] — held by BOTH
+    /// [`ProviderRecord::new`] and deserialization ([`deserialize_capped_addresses`]), so a record
+    /// off the wire carries the same guarantee as a constructed one.
+    #[serde(deserialize_with = "deserialize_capped_addresses")]
     pub addresses: Vec<CandidateAddr>,
     /// Absolute expiry (Unix seconds). A record at/after this time is stale.
     pub expires_at: u64,
@@ -431,6 +455,71 @@ mod tests {
         assert_eq!(
             rec.addresses[0].host, "2001:db8::1",
             "the single most-preferred (IPv6 direct) candidate must survive truncation"
+        );
+    }
+
+    // ---- Deserialization-time address bound (#1514) ----
+
+    /// Build the JSON of a record carrying `n` addresses — the shape a hostile peer frames on the
+    /// wire, bypassing `ProviderRecord::new` entirely (its fields are public).
+    fn record_json_with_addresses(n: usize) -> String {
+        let addrs: Vec<String> = (0..n)
+            .map(|i| format!(r#"{{"host":"198.51.100.{}","port":1,"kind":"relay"}}"#, i % 255))
+            .collect();
+        format!(
+            r#"{{"content_key":"{}","provider_peer_id":"{}","addresses":[{}],"expires_at":1}}"#,
+            "aa".repeat(32),
+            "bb".repeat(32),
+            addrs.join(",")
+        )
+    }
+
+    #[test]
+    fn deserialization_bounds_the_address_count() {
+        // #1514: the cap must hold BY CONSTRUCTION at the decode boundary, not only at the ingest
+        // call sites that remember to call `sort_and_cap_addresses`. Stated over the CLASS: no
+        // deserialized record, from any source, ever carries more than the cap.
+        let rec: ProviderRecord = serde_json::from_str(&record_json_with_addresses(1000)).unwrap();
+        assert_eq!(rec.addresses.len(), MAX_ADDRESSES_PER_RECORD);
+    }
+
+    #[test]
+    fn deserialization_bound_is_one_off_exact() {
+        // The one-off variant: exactly the cap survives untouched; exactly one more is bounded.
+        let at_cap: ProviderRecord =
+            serde_json::from_str(&record_json_with_addresses(MAX_ADDRESSES_PER_RECORD)).unwrap();
+        assert_eq!(at_cap.addresses.len(), MAX_ADDRESSES_PER_RECORD);
+        let over_by_one: ProviderRecord =
+            serde_json::from_str(&record_json_with_addresses(MAX_ADDRESSES_PER_RECORD + 1)).unwrap();
+        assert_eq!(over_by_one.addresses.len(), MAX_ADDRESSES_PER_RECORD);
+    }
+
+    #[test]
+    fn deserialization_keeps_the_most_preferred_addresses() {
+        // Bounding must drop the LEAST preferred candidates, so a hostile peer cannot bury the one
+        // genuinely reachable address behind a wall of filler and have it truncated away.
+        let mut addrs: Vec<String> =
+            vec![r#"{"host":"2001:db8::1","port":9444,"kind":"direct"}"#.to_string()];
+        for i in 0..1000 {
+            addrs.push(format!(
+                r#"{{"host":"198.51.100.{}","port":1,"kind":"relay"}}"#,
+                i % 255
+            ));
+        }
+        // The preferred candidate sits LAST in the wire order, so a naive prefix-truncation would
+        // discard exactly the address that matters.
+        addrs.rotate_left(1);
+        let json = format!(
+            r#"{{"content_key":"{}","provider_peer_id":"{}","addresses":[{}],"expires_at":1}}"#,
+            "aa".repeat(32),
+            "bb".repeat(32),
+            addrs.join(",")
+        );
+        let rec: ProviderRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(rec.addresses.len(), MAX_ADDRESSES_PER_RECORD);
+        assert_eq!(
+            rec.addresses[0].host, "2001:db8::1",
+            "the most-preferred candidate must survive the bound regardless of wire position"
         );
     }
 }
