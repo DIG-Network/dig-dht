@@ -59,10 +59,20 @@ impl Contact {
         self.peer_id().as_ref().map(Key::from_peer_id)
     }
 
-    /// The IPv6-preferred, most-direct dialable candidate address, if any. `addresses` is already
-    /// IPv6-first-then-rank sorted, so this is simply the first dialable entry.
+    /// The FIRST candidate only — the IPv6-preferred, most-direct dialable address, if any.
+    ///
+    /// **Prefer [`dial_candidates`](Self::dial_candidates) for dialing**: one address means one
+    /// attempt and no fallback, so an unusable IPv6 candidate masks a working IPv4 one (§5.2). Use
+    /// this only where a single representative address is what is wanted (a log line, a display
+    /// string, a metric label).
     pub fn best_address(&self) -> Option<&CandidateAddr> {
         self.addresses.iter().find(|a| a.kind.is_dialable())
+    }
+
+    /// This contact's dialable candidates in §5.2 dial order — see
+    /// [`record::dial_candidates`](crate::record::dial_candidates) for the ordering contract.
+    pub fn dial_candidates(&self) -> Vec<&CandidateAddr> {
+        crate::record::dial_candidates(&self.addresses)
     }
 }
 
@@ -506,7 +516,12 @@ mod tests {
         // peer that queries us, so the address bound must hold at the decode boundary itself — not
         // only at whichever ingest site remembered to cap it.
         let addrs: Vec<String> = (0..1000)
-            .map(|i| format!(r#"{{"host":"198.51.100.{}","port":1,"kind":"relay"}}"#, i % 255))
+            .map(|i| {
+                format!(
+                    r#"{{"host":"198.51.100.{}","port":1,"kind":"relay"}}"#,
+                    i % 255
+                )
+            })
             .collect();
         let json = format!(
             r#"{{"peer_id":"{}","addresses":[{}]}}"#,
@@ -515,5 +530,26 @@ mod tests {
         );
         let c: Contact = serde_json::from_str(&json).unwrap();
         assert_eq!(c.addresses.len(), crate::record::MAX_ADDRESSES_PER_RECORD);
+    }
+
+    #[test]
+    fn contact_dial_candidates_order_v6_then_v4_then_unresolvable() {
+        // #1594: a contact is dialed exactly like a provider, so it must expose the SAME ordered
+        // candidate list rather than leaving each consumer to re-derive §5.2.
+        let c = Contact::new(
+            &pid([1u8; 32]),
+            vec![
+                CandidateAddr::direct("not-a-literal", 9444),
+                CandidateAddr::direct("203.0.113.7", 9444),
+                CandidateAddr::direct("2001:db8::1", 9444),
+                CandidateAddr::relay_marker(),
+            ],
+        );
+        let hosts: Vec<&str> = c
+            .dial_candidates()
+            .iter()
+            .map(|a| a.host.as_str())
+            .collect();
+        assert_eq!(hosts, vec!["2001:db8::1", "203.0.113.7", "not-a-literal"]);
     }
 }

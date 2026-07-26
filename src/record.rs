@@ -84,11 +84,17 @@ impl CandidateAddr {
     }
 
     /// The address-family half of the sort key, derived from [`dig_ip::Family`] — the ecosystem's
-    /// single source of truth for the IPv6-first / IPv4-fallback rule (CLAUDE.md §5.2). `0` for a
-    /// genuine IPv6 literal, `1` for an IPv4 literal (including an IPv4-mapped IPv6 address, which
-    /// [`Family::of`] correctly classifies as V4 — it is IPv4 reachability) OR a hostname (which
-    /// parses as neither and falls back with IPv4). Deriving the family here, rather than
-    /// hand-rolling an `is_ipv6` check, keeps dig-dht from drifting off the canonical contract.
+    /// single source of truth for the IPv6-first / IPv4-fallback rule (CLAUDE.md §5.2):
+    ///
+    /// - `0` — a genuine IPv6 literal (tried first);
+    /// - `1` — an IPv4 literal, INCLUDING an IPv4-mapped IPv6 address, which [`Family::of`]
+    ///   correctly classifies as V4 because it is IPv4 reachability (the fallback);
+    /// - `2` — a host that is not an IP literal at all. A DHT candidate is an *observed* socket
+    ///   address, so a non-literal is a malformed or hostname-bearing record whose reachability this
+    ///   crate cannot classify and does not resolve; it must never outrank a usable IPv4 literal.
+    ///
+    /// Deriving the family here, rather than hand-rolling an `is_ipv6` check, keeps dig-dht from
+    /// drifting off the canonical contract.
     fn family_rank(&self) -> u8 {
         let family = self
             .host
@@ -97,7 +103,8 @@ impl CandidateAddr {
             .map(|ip| Family::of(&SocketAddr::new(ip, self.port)));
         match family {
             Some(Family::V6) => 0,
-            Some(Family::V4) | None => 1,
+            Some(Family::V4) => 1,
+            None => 2,
         }
     }
 
@@ -140,6 +147,36 @@ pub const MAX_ADDRESSES_PER_RECORD: usize = 8;
 pub(crate) fn sort_and_cap_addresses(addresses: &mut Vec<CandidateAddr>) {
     sort_addresses_ipv6_first(addresses);
     addresses.truncate(MAX_ADDRESSES_PER_RECORD);
+}
+
+/// Upper bound on how many candidates [`dial_candidates`] hands a dialer for ONE peer, so a record
+/// padded with addresses cannot turn a single holder into a connect storm. Byte-for-byte the same
+/// bound dig-download applies on its own dial path, so a consumer that adopts this iterator sees no
+/// change in attempt count.
+pub const MAX_DIAL_CANDIDATES: usize = 4;
+
+/// The dialable candidates of `addresses`, in **dial order**: IPv6 first, then IPv4, then anything
+/// unresolvable — deduped by `host:port` and capped at [`MAX_DIAL_CANDIDATES`].
+///
+/// This is the §5.2-compliant order (IPv6-first, IPv4-**fallback**) and the ONE place the DHT
+/// expresses it, so every consumer inherits it instead of re-deriving a ranking of its own. A dialer
+/// walks the WHOLE list and only reports failure once every candidate has been tried: in #836 a
+/// reader instead took a single address, tried one IPv6 literal, and gave up while a working IPv4
+/// candidate sat unused — v4 is the fallback, so a failed v6 attempt MUST fall through to it.
+///
+/// Relay markers are excluded (they are not directly dialable — reach those peers via the relay /
+/// a brokered punch). Unresolvable candidates are KEPT, last, on purpose: a dialer that walks them
+/// can report a concrete per-candidate reason instead of pretending the provider had no address.
+pub fn dial_candidates(addresses: &[CandidateAddr]) -> Vec<&CandidateAddr> {
+    let mut candidates: Vec<&CandidateAddr> =
+        addresses.iter().filter(|a| a.kind.is_dialable()).collect();
+    // Sorted defensively rather than trusting the stored order: the same ranking is applied when a
+    // list is constructed or deserialized, but `addresses` is a public field any caller may rewrite.
+    candidates.sort_by_key(|a| a.family_then_kind_rank());
+    let mut seen = std::collections::HashSet::new();
+    candidates.retain(|a| seen.insert((a.host.as_str(), a.port)));
+    candidates.truncate(MAX_DIAL_CANDIDATES);
+    candidates
 }
 
 /// serde hook applied to every `addresses` field ([`ProviderRecord`], [`crate::routing::Contact`]),
@@ -220,11 +257,22 @@ impl ProviderRecord {
         now >= self.expires_at
     }
 
-    /// The IPv6-preferred, most-direct dialable candidate address, if any — the address a finder
-    /// dials first. `addresses` is already IPv6-first-then-rank sorted (`sort_addresses_ipv6_first`),
-    /// so this is simply the first dialable entry.
+    /// The FIRST candidate only — the IPv6-preferred, most-direct dialable address, if any.
+    ///
+    /// **Prefer [`dial_candidates`](Self::dial_candidates) for dialing.** This returns one address,
+    /// so a caller that dials it and stops has made a single attempt and cannot fall back: an
+    /// unusable IPv6 candidate then masks a working IPv4 one, violating the IPv4-**fallback** half
+    /// of §5.2 (exactly the #836 read-leg failure). Use this only where a single representative
+    /// address is genuinely what is wanted — a log line, a display string, a metric label.
     pub fn best_address(&self) -> Option<&CandidateAddr> {
         self.addresses.iter().find(|a| a.kind.is_dialable())
+    }
+
+    /// This provider's dialable candidates in §5.2 dial order — see [`dial_candidates`] for the
+    /// ordering contract. Dial these in order, falling through on failure, before concluding the
+    /// holder is unreachable.
+    pub fn dial_candidates(&self) -> Vec<&CandidateAddr> {
+        dial_candidates(&self.addresses)
     }
 }
 
@@ -464,7 +512,12 @@ mod tests {
     /// wire, bypassing `ProviderRecord::new` entirely (its fields are public).
     fn record_json_with_addresses(n: usize) -> String {
         let addrs: Vec<String> = (0..n)
-            .map(|i| format!(r#"{{"host":"198.51.100.{}","port":1,"kind":"relay"}}"#, i % 255))
+            .map(|i| {
+                format!(
+                    r#"{{"host":"198.51.100.{}","port":1,"kind":"relay"}}"#,
+                    i % 255
+                )
+            })
             .collect();
         format!(
             r#"{{"content_key":"{}","provider_peer_id":"{}","addresses":[{}],"expires_at":1}}"#,
@@ -490,7 +543,8 @@ mod tests {
             serde_json::from_str(&record_json_with_addresses(MAX_ADDRESSES_PER_RECORD)).unwrap();
         assert_eq!(at_cap.addresses.len(), MAX_ADDRESSES_PER_RECORD);
         let over_by_one: ProviderRecord =
-            serde_json::from_str(&record_json_with_addresses(MAX_ADDRESSES_PER_RECORD + 1)).unwrap();
+            serde_json::from_str(&record_json_with_addresses(MAX_ADDRESSES_PER_RECORD + 1))
+                .unwrap();
         assert_eq!(over_by_one.addresses.len(), MAX_ADDRESSES_PER_RECORD);
     }
 
@@ -521,5 +575,115 @@ mod tests {
             rec.addresses[0].host, "2001:db8::1",
             "the most-preferred candidate must survive the bound regardless of wire position"
         );
+    }
+
+    // ---- Ordered dial candidates (#1594) ----
+
+    fn record_with(addresses: Vec<CandidateAddr>) -> ProviderRecord {
+        ProviderRecord::new(&Key::from_bytes([0u8; 32]), &pid(1), addresses, 10)
+    }
+
+    #[test]
+    fn dial_candidates_order_v6_then_v4_then_unresolvable() {
+        let rec = record_with(vec![
+            CandidateAddr::direct("not-a-literal", 9444),
+            CandidateAddr::direct("203.0.113.7", 9444),
+            CandidateAddr::direct("2001:db8::1", 9444),
+        ]);
+        let hosts: Vec<&str> = rec
+            .dial_candidates()
+            .iter()
+            .map(|a| a.host.as_str())
+            .collect();
+        assert_eq!(
+            hosts,
+            vec!["2001:db8::1", "203.0.113.7", "not-a-literal"],
+            "dial order is IPv6, then IPv4, then anything unresolvable (§5.2)"
+        );
+    }
+
+    #[test]
+    fn dial_candidates_keep_the_ipv4_fallback_behind_an_ipv6_candidate() {
+        // The #836 failure this exists to prevent: a probe took `best_address()` alone, tried ONE
+        // IPv6 literal, and gave up while a working IPv4 candidate sat unused. IPv4 is the FALLBACK
+        // (§5.2), so it MUST still be present, after the v6 candidate, for a dialer to walk to.
+        let rec = record_with(vec![
+            CandidateAddr::direct("2001:db8::1", 9444),
+            CandidateAddr::direct("172.31.79.22", 9444),
+        ]);
+        let candidates = rec.dial_candidates();
+        assert_eq!(candidates.len(), 2, "the fallback must not be dropped");
+        assert_eq!(candidates[0].host, "2001:db8::1");
+        assert_eq!(candidates[1].host, "172.31.79.22");
+    }
+
+    #[test]
+    fn dial_candidates_treat_v4_mapped_v6_as_ipv4() {
+        // Canonical IPv4-in-IPv6 rule: `::ffff:a.b.c.d` is IPv4 REACHABILITY, so it must order with
+        // IPv4 — after a genuine IPv6 candidate. This is the one case where a hand-rolled
+        // `is_ipv6`-style check silently disagrees with `dig_ip::Family`.
+        let rec = record_with(vec![
+            CandidateAddr::direct("::ffff:203.0.113.9", 9444),
+            CandidateAddr::direct("2001:db8::1", 9444),
+        ]);
+        let hosts: Vec<&str> = rec
+            .dial_candidates()
+            .iter()
+            .map(|a| a.host.as_str())
+            .collect();
+        assert_eq!(hosts, vec!["2001:db8::1", "::ffff:203.0.113.9"]);
+    }
+
+    #[test]
+    fn dial_candidates_exclude_relay_markers() {
+        let rec = record_with(vec![
+            CandidateAddr::relay_marker(),
+            CandidateAddr::direct("2001:db8::1", 9444),
+        ]);
+        let candidates = rec.dial_candidates();
+        assert_eq!(
+            candidates.len(),
+            1,
+            "a relay marker is not directly dialable"
+        );
+        assert_eq!(candidates[0].host, "2001:db8::1");
+    }
+
+    #[test]
+    fn dial_candidates_are_bounded_and_deduped() {
+        // A record may legitimately carry up to MAX_ADDRESSES_PER_RECORD candidates; a dialer must
+        // not turn one provider into an unbounded connect storm, and must not waste an attempt
+        // re-dialing the same host:port twice.
+        let mut addresses = vec![CandidateAddr::direct("2001:db8::1", 9444); 3];
+        addresses.extend((0..5).map(|i| CandidateAddr::direct(format!("10.0.0.{i}"), 9444)));
+        let rec = record_with(addresses);
+        let candidates = rec.dial_candidates();
+        assert_eq!(candidates.len(), MAX_DIAL_CANDIDATES);
+        assert_eq!(
+            candidates
+                .iter()
+                .filter(|a| a.host == "2001:db8::1")
+                .count(),
+            1,
+            "a repeated host:port contributes exactly one dial attempt"
+        );
+    }
+
+    #[test]
+    fn dial_candidates_of_a_relay_only_record_are_empty() {
+        let rec = record_with(vec![CandidateAddr::relay_marker()]);
+        assert!(rec.dial_candidates().is_empty());
+    }
+
+    #[test]
+    fn unresolvable_host_sorts_after_an_ipv4_literal_in_the_stored_order() {
+        // The stored order and the dial order share ONE ranking policy, so a hostname (which is not
+        // reachability the DHT can classify) must never outrank a usable IPv4 literal anywhere.
+        let rec = record_with(vec![
+            CandidateAddr::direct("not-a-literal", 1),
+            CandidateAddr::direct("203.0.113.7", 1),
+        ]);
+        let hosts: Vec<&str> = rec.addresses.iter().map(|a| a.host.as_str()).collect();
+        assert_eq!(hosts, vec!["203.0.113.7", "not-a-literal"]);
     }
 }

@@ -186,11 +186,15 @@ ProviderRecord = { "content_key":"<64hex>", "provider_peer_id":"<64hex>",
   most-direct-first `kind` rank remains dig-dht's own tiebreak within a family. `dig_ip::Family`
   classifies `host` from a real `IpAddr` parse (not a `contains(':')` heuristic), and in particular
   classifies an IPv4-mapped IPv6 literal (`::ffff:a.b.c.d`) as **IPv4** — it is IPv4 reachability, so
-  it sorts with the IPv4 family. Address order on the wire is therefore IPv6-first-then-rank as
+  it sorts with the IPv4 family. The family half has **three** tiers: IPv6 literal (0) < IPv4
+  literal (1) < a `host` that is not an IP literal at all (2). A DHT candidate is an *observed*
+  socket address, so a non-literal is a malformed or hostname-bearing record whose reachability this
+  specification does not classify and an implementation does not resolve on the dial path; it MUST
+  NOT outrank a usable IPv4 literal. Address order on the wire is therefore IPv6-first-then-rank as
   produced by a conforming implementation; a consumer that receives a record from a
   non-conforming/older peer MUST NOT assume the ordering and SHOULD still pick by family-then-rank
-  itself. A bare `relay` marker (`host:""`, `port:0`) is not directly dialable and sorts as
-  IPv4/hostname (its empty `host` does not parse as an IP). This ordering is additive: it does not
+  itself. A bare `relay` marker (`host:""`, `port:0`) is not directly dialable and sorts in the
+  non-literal tier (its empty `host` does not parse as an IP), last by `kind` rank. This ordering is additive: it does not
   change the `CandidateAddr` field names, types, or JSON encoding — only the list order.
 - **Address-list cap is a receive-side limit, NOT a wire encoding change.** `addresses[]` carries
   no length prefix or bound of its own on the wire beyond the overall `MAX_FRAMED_BODY` frame
@@ -205,6 +209,24 @@ ProviderRecord = { "content_key":"<64hex>", "provider_peer_id":"<64hex>",
   `find_providers` caller. This bounds per-record memory and the amplification of re-serving a
   received list to other peers without changing what a conforming peer may transmit or how a
   receiver decodes it.
+- **The cap MUST hold by construction at the decode boundary.** Deserializing a `ProviderRecord` or
+  a `Contact` MUST itself sort-then-truncate `addresses` to `MAX_ADDRESSES_PER_RECORD`, so no
+  deserialized value — from a peer's frame, a config file, or a cached snapshot — can carry an
+  unbounded list even if some future ingest path forgets to cap it. Enforcement at decode
+  **bounds, never rejects**: an over-long list MUST still parse successfully (a decode error would
+  make a non-conforming or older producer's record unreadable and would hand a peer a way to poison
+  a whole frame). Because the sort precedes the truncation, the most-preferred candidates survive
+  regardless of the order the sender listed them in.
+- **Dial order (the candidate iterator).** An implementation MUST expose, for both a
+  `ProviderRecord` and a `Contact`, the peer's **dialable** candidates in dial order — the
+  family-then-`kind` ranking above (IPv6, then IPv4, then non-literal), deduplicated by
+  `host:port` and capped at `MAX_DIAL_CANDIDATES` (**4**). A dialer MUST walk that list, falling
+  through on each failure, and MUST NOT conclude a holder is unreachable until every candidate has
+  been tried: IPv4 is the **fallback** (CLAUDE.md §5.2), so a failed IPv6 attempt must never mask a
+  working IPv4 candidate. A single-address accessor (`best_address`) is a display/logging
+  convenience and MUST NOT be the basis of a dial decision. Relay markers are excluded (those peers
+  are reached via the relay / a brokered punch); non-literal candidates are retained last so a
+  dialer can report a concrete per-candidate reason rather than reporting no address at all.
 
 ### 5.6 Hex-case requirement
 
@@ -250,8 +272,15 @@ Every node keeps a local provider store, which MUST behave as:
 - **Bounded admission control (`put`).** A genuinely new `(content_key, provider_peer_id)` pair is
   subject to two caps, both enforced on every `put`, not just at GC time:
   - **Per-key cap** (`max_providers_per_key`, default **20** — equal to `k`): when a new provider
-    for a key would exceed this, the **soonest-to-expire** existing record for that key is evicted
-    to make room.
+    for a key would exceed this, one existing record for that key is evicted to make room, chosen
+    by the **established-floor** policy: the `max_providers_per_key / 2` providers of that key that
+    this node admitted EARLIEST are reserved and MUST NOT be evicted; the victim is the
+    soonest-to-expire record among the remaining (newest) slots, ties broken by admission order so
+    the choice is deterministic. A store MUST record each provider's admission order on first
+    admission and MUST PRESERVE it across refreshes — a republish (the mechanism by which an honest
+    holder stays findable) must never cost that holder its establishment. Because the reserved
+    floor is strictly smaller than the cap, a newcomer can always be admitted; the policy bounds
+    WHOM a flood can displace, never whether new holders can be learned.
   - **Global cap** (`max_total_records`, default **100 000**): when a new `(content_key,
     provider_peer_id)` pair would exceed this, the `put` is **rejected**
     (`PutOutcome::RejectedOverCapacity`) rather than stored. Rejection MUST NOT evict a
@@ -349,6 +378,24 @@ being advertised at once rather than after a TTL:
 - **`holders_of(content) -> Result<Vec<PeerId>, DhtError>`** — a thin, address-free projection over `find_providers`
   (§9.2) for callers that only need "which peers hold X". `find_providers` (which returns full
   records with candidate addresses the download layer dials) remains the PRIMARY query.
+
+### 6.7 Answer-to-question binding (finder side)
+
+A responder's `providers` answer is untrusted input: a `ProviderRecord` carries no signature and the
+responding peer is not the record's subject, so a peer on a lookup path may return records naming
+any `provider_peer_id` at any `addresses`, for any `content_key`.
+
+A finder MUST therefore **discard every returned record whose `content_key` is not the key it
+queried**, and MUST do so before the record can influence the lookup — specifically before the
+`stop_on_providers` early-exit decision (§8) and before any record is returned to the finder's
+caller. Off-key records that reach a caller become dial targets, giving any peer on the path a free
+way to fan out a finder's dial attempts (wasted-dial DoS and lookup amplification); off-key records
+counted as "found" would additionally end the walk before it reached a real holder, which turns the
+same free lie into content-discovery censorship.
+
+This is an equality check on the full 64-hex `content_key`, not a prefix or distance test: a
+near-miss key is not the queried key. Records the finder holds LOCALLY are indexed by key and are
+therefore already bound to it.
 
 ## 7. Routing table
 
@@ -464,7 +511,9 @@ and discovery would be impossible). For that, the routing table is also fed LIVE
   from other nodes; it ages out via TTL. Returns whether the key was being announced.
 - **`find_providers(content)`** — merge (a) locally held live records for the key and (b) the
   records collected by an iterative lookup toward the key (`stop_on_providers = true`), dedup by
-  provider `peer_id`, drop expired records, and return the result. An empty result is **not** an
+  provider `peer_id`, drop expired records, and return the result. Records a queried peer returns
+  for a DIFFERENT `content_key` are discarded at the wire boundary before they can affect the walk
+  (§6.7). An empty result is **not** an
   error — it means no known providers. `DhtError::NoPeers` is returned only when a lookup has no
   one to seed from *and* is expected to run (`find_node`); `find_providers` with an empty routing
   table returns whatever is held locally (possibly empty).
@@ -593,9 +642,18 @@ Invariant: **no single peer failure is ever fatal to a lookup.**
   dead, resisting table-flush attacks by newly minted ids.
 - **Soft state.** Provider records self-expire (§6.2); a withdrawn or dead provider disappears
   within one `provider_ttl` without any delete protocol.
-- **Bounded provider store.** `add_provider` is admission-controlled (§6.3): a per-key cap
-  (soonest-to-expire eviction) and a global cap (rejection) bound the memory a single peer's
-  `add_provider` traffic can consume, independent of any rate limiting the embedding node may add.
+- **Bounded provider store.** `add_provider` is admission-controlled (§6.3): a per-key cap and a
+  global cap (rejection) bound the memory a single peer's `add_provider` traffic can consume,
+  independent of any rate limiting the embedding node may add.
+- **Sybil-resistant provider eviction.** Because an inbound record's expiry is clamped to the
+  responder's own TTL horizon, a provider that announces LATER necessarily carries a later
+  `expires_at`; a plain soonest-to-expire eviction would therefore make an honest incumbent the
+  deterministic victim of any later announcer, letting `max_providers_per_key` freely-minted Sybil
+  identities evict the ONLY real holder of a capsule and leave that content undiscoverable through
+  the node (and, repeated across the k-closest, network-wide). The established-floor policy (§6.3)
+  reserves each key's earliest-admitted half from eviction, so a flood can churn the newest slots
+  but cannot displace an established holder however many identities it spends or however it times
+  its expiries. This mirrors the LRS bucket policy applied to contacts (§7.2).
 - **TTL clamp.** An inbound `expires_at` is never trusted as received: it is clamped to the
   responder's own TTL horizon (§6.2) before storage, so a malicious record can never outlive local
   GC indefinitely — combined with the bounded store above, this makes the worst case from a
@@ -604,7 +662,13 @@ Invariant: **no single peer failure is ever fatal to a lookup.**
   a routing-table `Contact`, or a `find_providers` result handed back to a caller) is capped at
   `MAX_ADDRESSES_PER_RECORD` (§5.5) — a single record/contact can never carry an unbounded address
   list, which would otherwise inflate per-record memory and, once stored, be re-served (cloned) to
-  every peer that later queries for it (bandwidth amplification).
+  every peer that later queries for it (bandwidth amplification). The cap is additionally enforced
+  at the decode boundary itself (§5.5), so the bound holds by construction for every deserialized
+  value rather than only at the ingest sites that remember to apply it.
+- **Answer-to-question binding.** A finder discards provider records returned for a key it did not
+  query (§6.7), before the early-exit decision and before returning anything to its caller — so a
+  peer on the lookup path cannot fan out the finder's dial attempts or halt its walk with records it
+  was never asked for.
 - **Self-announce identity check.** When the caller identity is known, `add_provider` is rejected
   (error code `4`) unless `record.provider_peer_id == caller.peer_id` (§6.4) — an authenticated
   caller may announce only itself, never vouch for a third party.
@@ -630,7 +694,10 @@ Exported from the crate root (`#![forbid(unsafe_code)]`, MSRV **1.75.0**, licens
   `ingest_verified_provider(ProviderRecord)`, `remove_provider_record(String, PeerId)`,
   `retract_own_provider(&ContentId)`, `holders_of(&ContentId)`.
 - `DhtConfig` (§12), `ContentId` (§3–4), `Key` / `Distance` (§2), `ProviderRecord` /
-  `CandidateAddr` / `AddressKind` / `MAX_ADDRESSES_PER_RECORD` (§5.5, §6), `Contact` /
+  `CandidateAddr` / `AddressKind` / `MAX_ADDRESSES_PER_RECORD` / `dial_candidates` /
+  `MAX_DIAL_CANDIDATES` (§5.5, §6) — `ProviderRecord::dial_candidates()` and
+  `Contact::dial_candidates()` are the §5.2-compliant dial-order accessors, and `best_address()` on
+  either type returns the first candidate only (display/logging, never a dial decision), `Contact` /
   `RoutingTable` (§7), `BootstrapPeer` (§9.1), `DhtTransport` (§11), `DhtRequest` / `DhtResponse` +
   `MAX_FRAMED_BODY` (§5), `DhtError` (§13), and the re-exported `dig_nat::PeerId` (one
   peer-identity type across the transport and the DHT).
