@@ -27,11 +27,11 @@ use tokio::sync::Mutex;
 
 use dig_nat::PeerId;
 
+use crate::clock::now_secs;
 use crate::config::DhtConfig;
 use crate::content::ContentId;
 use crate::error::DhtError;
 use crate::key::Key;
-use crate::clock::now_secs;
 use crate::lookup::{iterative_find, QueryOutcome};
 use crate::provider_store::{ProviderStore, PutOutcome};
 use crate::record::{CandidateAddr, ProviderRecord};

@@ -23,6 +23,47 @@ The same reasoning is why establishment is an admission ORDINAL rather than a ti
 needs no clock threaded through `ProviderStore::put`, and there is nothing in it for a peer to
 influence.
 
+## A preference policy must never outrank liveness
+
+The establishment floor added for #1434 reserved a key's earliest-admitted providers from eviction —
+and, as first written, reserved them by admission order ALONE. That silently inverted a property the
+previous policy had for free: `min_by_key(expires_at)` always evicted an expired record first, so dead
+slots were self-clearing. With a floor in front of it, a dead record inside the floor outranked a live
+provider in the churn zone.
+
+What makes this worth recording is that it needed no attacker. The node's GC tick is hourly while
+`provider_ttl` is two hours, so ordinary churn — a holder shutting down, a cache evicting a capsule —
+leaves expired records inside a key's floor for up to an hour, and during that window every new
+announcement evicted a live provider. Announcing MORE holders made a capsule LESS discoverable. A
+hardening change had turned the replication flywheel backwards.
+
+The generalisable rule: when adding a preference/reservation policy on top of an eviction rule, check
+what the OLD rule was giving you incidentally. Ranking by a value (`expires_at`) had encoded a liveness
+test; ranking by a different value (`admitted_seq`) dropped it. Liveness is a precondition, not a
+preference — it belongs before the policy, not inside it.
+
+A related shape: the four #1434 tests were written with expiry values like `100` and passed through
+`put`, which reads the wall clock — so every record in them was *already expired* by ~1.8 billion
+seconds. They asserted establishment while testing nothing of the kind. Any test about record
+preference must pin `now` explicitly (`put_at`), or the values silently mean something else.
+
+## A cap applied after a sort can delete a whole tier
+
+`dial_candidates` sorted IPv6-first then truncated to 4, which is correct in aggregate and wrong at the
+boundary: a holder advertising four IPv6 candidates yielded a dial set containing NO IPv4, so a dialer
+that faithfully walked every candidate still never reached the working address — the exact #836 failure
+the iterator was built to prevent. Again reachable without an attacker, since a dual-stack holder
+legitimately emits direct + mapped + reflexive v6 and the 8-address record cap leaves room.
+
+Sort-then-truncate silently assumes the head of the list is REPRESENTATIVE of it. When the ordering is
+by tier and a lower tier is a *fallback* (i.e. load-bearing precisely when the preferred tier fails),
+the cap must reserve a slot for it. A ranking expresses preference; it must not be allowed to express
+exclusion.
+
+The dedup key interacts with this: deduplicating on the raw host string let one address spelled four
+ways (`2001:db8::1`, `2001:0db8::1`, `2001:db8:0:0:0:0:0:1`, `2001:DB8::1`) consume the entire cap.
+Dedup by PARSED endpoint, not by text, wherever the text has a canonical form.
+
 ## Capping at call sites is not the same as capping by construction
 
 `ProviderRecord` and `Contact` have **public fields**, so `ProviderRecord::new`'s address cap is

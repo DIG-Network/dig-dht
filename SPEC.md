@@ -219,8 +219,22 @@ ProviderRecord = { "content_key":"<64hex>", "provider_peer_id":"<64hex>",
   regardless of the order the sender listed them in.
 - **Dial order (the candidate iterator).** An implementation MUST expose, for both a
   `ProviderRecord` and a `Contact`, the peer's **dialable** candidates in dial order — the
-  family-then-`kind` ranking above (IPv6, then IPv4, then non-literal), deduplicated by
-  `host:port` and capped at `MAX_DIAL_CANDIDATES` (**4**). A dialer MUST walk that list, falling
+  family-then-`kind` ranking above (IPv6, then IPv4, then non-literal), deduplicated by ENDPOINT and
+  capped at `MAX_DIAL_CANDIDATES` (**4**).
+  - **Deduplication is by parsed endpoint, not by host text.** Two candidates naming the same
+    address in different spellings (`2001:db8::1`, `2001:0db8::1`, `2001:db8:0:0:0:0:0:1`,
+    `2001:DB8::1`) are ONE dial target, and an IPv4-mapped IPv6 literal reduces to its IPv4 form, so
+    `::ffff:a.b.c.d` and `a.b.c.d` are the same endpoint (consistent with both ranking as IPv4
+    reachability). A non-literal host deduplicates on its text. Distinct ports are always distinct
+    targets. Text-based dedup would let one address, spelled `MAX_DIAL_CANDIDATES` ways, consume the
+    entire dial set.
+  - **The cap MUST NOT eliminate the fallback tier.** Truncating the family-sorted list outright lets
+    the preferred tier fill the cap alone: a holder advertising `MAX_DIAL_CANDIDATES` or more IPv6
+    candidates would yield a dial set with NO IPv4, so a dialer that walked every candidate it was
+    given would still never reach a working IPv4 address. When the cap would exclude every non-IPv6
+    candidate and at least one exists, the least-preferred kept slot MUST be given to the best
+    non-IPv6 candidate. IPv6 still leads the resulting list; the reservation costs one surplus IPv6
+    attempt, never the ordering. A dialer MUST walk that list, falling
   through on each failure, and MUST NOT conclude a holder is unreachable until every candidate has
   been tried: IPv4 is the **fallback** (CLAUDE.md §5.2), so a failed IPv6 attempt must never mask a
   working IPv4 candidate. A single-address accessor (`best_address`) is a display/logging
@@ -272,15 +286,35 @@ Every node keeps a local provider store, which MUST behave as:
 - **Bounded admission control (`put`).** A genuinely new `(content_key, provider_peer_id)` pair is
   subject to two caps, both enforced on every `put`, not just at GC time:
   - **Per-key cap** (`max_providers_per_key`, default **20** — equal to `k`): when a new provider
-    for a key would exceed this, one existing record for that key is evicted to make room, chosen
-    by the **established-floor** policy: the `max_providers_per_key / 2` providers of that key that
-    this node admitted EARLIEST are reserved and MUST NOT be evicted; the victim is the
-    soonest-to-expire record among the remaining (newest) slots, ties broken by admission order so
-    the choice is deterministic. A store MUST record each provider's admission order on first
-    admission and MUST PRESERVE it across refreshes — a republish (the mechanism by which an honest
-    holder stays findable) must never cost that holder its establishment. Because the reserved
-    floor is strictly smaller than the cap, a newcomer can always be admitted; the policy bounds
-    WHOM a flood can displace, never whether new holders can be learned.
+    for a key would exceed this, one existing record for that key is evicted to make room, chosen in
+    **two ordered steps**:
+    1. **An EXPIRED record is the victim, wherever it sits** — including inside the reserved floor
+       below. An expired record is already invisible to `get` and merely awaits GC, so reclaiming its
+       slot costs nothing. **Liveness MUST outrank establishment**: a reserved-but-dead record must
+       never cause a LIVE provider to be evicted. This is not merely an adversarial concern — a
+       node's GC period is coarser than `provider_ttl`, so a key whose earliest providers have gone
+       offline holds expired records inside its floor for a whole GC period, and a policy that
+       protected them would evict a live provider on every new announcement during that window,
+       making content LESS discoverable the more holders announce it.
+    2. **Otherwise every record is live and the established floor governs:** the
+       `max_providers_per_key / 2` providers of that key this node admitted EARLIEST are reserved and
+       MUST NOT be evicted; the victim is the soonest-to-expire among the remaining (newest) slots.
+    Ties break on admission order in both steps, so the choice is deterministic. A store MUST record
+    each provider's admission order on first admission and MUST PRESERVE it across refreshes — a
+    republish (the mechanism by which an honest holder stays findable) must never cost that holder its
+    establishment. Because the reserved floor is strictly smaller than the cap, a newcomer can always
+    be admitted; the policy bounds WHOM a flood can displace, never whether new holders can be
+    learned.
+  - **Residual (the floor protects an incumbent, not a latecomer).** An attacker that establishes
+    itself BEFORE an honest holder occupies the reserved floor and retains the full pre-policy
+    eviction primitive against every later arrival. That race is winnable routinely rather than
+    exceptionally: the provider store specified here is in-memory soft state with no persistence, so
+    every node restart resets each key's floor to first-come; keyspace churn that makes a node newly
+    one of the `k` closest does the same; and a node that caches content and then reshares it is a
+    late arrival by construction. **Provider-set membership MUST NOT be treated as Sybil-resistant**
+    — the floor raises the cost of displacing an established holder, and closing the vector requires
+    provider records to be cryptographically bound to their announcing identity (which this
+    specification does not yet define).
   - **Global cap** (`max_total_records`, default **100 000**): when a new `(content_key,
     provider_peer_id)` pair would exceed this, the `put` is **rejected**
     (`PutOutcome::RejectedOverCapacity`) rather than stored. Rejection MUST NOT evict a
@@ -652,8 +686,17 @@ Invariant: **no single peer failure is ever fatal to a lookup.**
   identities evict the ONLY real holder of a capsule and leave that content undiscoverable through
   the node (and, repeated across the k-closest, network-wide). The established-floor policy (§6.3)
   reserves each key's earliest-admitted half from eviction, so a flood can churn the newest slots
-  but cannot displace an established holder however many identities it spends or however it times
-  its expiries. This mirrors the LRS bucket policy applied to contacts (§7.2).
+  but cannot displace an ALREADY-ESTABLISHED holder however many identities it spends or however it
+  times its expiries. This mirrors the LRS bucket policy applied to contacts (§7.2). Eviction also
+  prefers reclaiming an EXPIRED record over any live one (§6.3), so the reservation can never cost a
+  live provider its slot.
+  - **Scope of that property — read this before relying on it.** It protects an INCUMBENT, not a
+    latecomer. An attacker that establishes first retains the full pre-policy primitive against all
+    later arrivals, and because the store is in-memory soft state the race resets on every node
+    restart (and on any keyspace churn that makes a node newly k-closest), while a cache-and-reshare
+    holder is a late arrival by construction. Membership of a provider set is therefore NOT
+    Sybil-resistant, and a consumer MUST NOT treat it as an authenticated holder list. Full closure
+    requires signed provider records (§14 "Known limitations" — records are not signed).
 - **TTL clamp.** An inbound `expires_at` is never trusted as received: it is clamped to the
   responder's own TTL horizon (§6.2) before storage, so a malicious record can never outlive local
   GC indefinitely — combined with the bounded store above, this makes the worst case from a
@@ -703,7 +746,10 @@ Exported from the crate root (`#![forbid(unsafe_code)]`, MSRV **1.75.0**, licens
   peer-identity type across the transport and the DHT).
 - `lookup::iterative_find` (§8) and `provider_store::ProviderStore` /
   `provider_store::ProviderStoreLimits` / `provider_store::PutOutcome` (§6.3) are public modules
-  usable directly.
+  usable directly. `ProviderStore::put_at(record, now)` is the admission entry point that takes the
+  caller's clock — `put(record)` delegates to it with the system clock — so admission, expiry, and
+  eviction can all be evaluated against ONE instant (§6.3 step 1 requires a liveness test, which
+  needs a `now`).
 
 Dependency posture: the crate depends on `dig-nat` for identity/transport types only — not on the
 gossip or Chia stacks — so the dependency tree stays minimal.
