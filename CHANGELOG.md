@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.9.0] - 2026-07-31
+
+### Features
+- **error:** DhtError carries SafeText, not String (#1674, #1675) (#16)
+
 ## [0.8.0] - 2026-07-27
 
 ### Chores
