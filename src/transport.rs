@@ -119,7 +119,10 @@ pub(crate) mod memory {
             request: &DhtRequest,
         ) -> Result<DhtResponse, DhtError> {
             if self.swarm.offline.lock().await.contains_key(&peer.peer_id) {
-                return Err(DhtError::transport(format!("{} is offline", peer.peer_id)));
+                return Err(DhtError::transport_from_untrusted(format!(
+                    "{} is offline",
+                    peer.peer_id
+                )));
             }
             let handler = {
                 let nodes = self.swarm.nodes.lock().await;
@@ -133,14 +136,17 @@ pub(crate) mod memory {
                     let mut cur = std::io::Cursor::new(encoded);
                     let decoded = DhtRequest::decode(&mut cur)
                         .await
-                        .map_err(DhtError::transport)?;
+                        .map_err(DhtError::transport_from_untrusted)?;
                     let resp = h(decoded);
                     let mut rcur = std::io::Cursor::new(resp.encode());
                     DhtResponse::decode(&mut rcur)
                         .await
-                        .map_err(DhtError::transport)
+                        .map_err(DhtError::transport_from_untrusted)
                 }
-                None => Err(DhtError::transport(format!("no route to {}", peer.peer_id))),
+                None => Err(DhtError::transport_from_untrusted(format!(
+                    "no route to {}",
+                    peer.peer_id
+                ))),
             }
         }
     }

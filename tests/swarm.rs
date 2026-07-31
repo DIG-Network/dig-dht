@@ -75,7 +75,7 @@ impl DhtTransport for RouterTransport {
         let mut cur = std::io::Cursor::new(encoded);
         let decoded = DhtRequest::decode(&mut cur)
             .await
-            .map_err(DhtError::transport)?;
+            .map_err(DhtError::transport_from_untrusted)?;
         let service = {
             let nodes = self.router.nodes.read().await;
             nodes.get(&peer.peer_id).cloned()
@@ -88,7 +88,7 @@ impl DhtTransport for RouterTransport {
                 let mut rcur = std::io::Cursor::new(resp.encode());
                 DhtResponse::decode(&mut rcur)
                     .await
-                    .map_err(DhtError::transport)
+                    .map_err(DhtError::transport_from_untrusted)
             }
             None => Err(DhtError::transport("no route")),
         }

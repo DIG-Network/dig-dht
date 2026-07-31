@@ -70,7 +70,7 @@ categories = ["network-programming"]
 # type, so dig-dht's public API is unchanged by this bump. On type identity ALONE a patch would have
 # been semver-honest. A re-export list proves nothing about version coupling until you resolve where
 # each type is DEFINED.
-dig-nat = "0.14"
+dig-nat = "0.15"
 
 # Address-family (IPv6-first / IPv4-fallback) contract — the ecosystem's single source of truth for
 # `Family::of` classification (CLAUDE.md §5.2, epic #1020). The DHT derives the FAMILY half of its
@@ -103,3 +103,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"
 
 [profile.release]
 overflow-checks = true
+
+# TEMPORARY (removed before merge): verify against the unpublished dig-nat 0.15 locally.
+[patch.crates-io]
+dig-nat = { path = "C:/tmp/worktrees/nat-1674" }
