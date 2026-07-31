@@ -118,6 +118,12 @@ u32 big-endian body length ‖ JSON body
   yield a partial message.
 - The JSON body is a `type`-tagged object (snake_case tags). Decoders MUST ignore unknown fields
   (forward compatibility: new fields are additive); an unknown `type` tag fails the decode.
+- **A decode failure MUST NOT quote the message back.** The invalid-data error a receiver raises MUST
+  state the failure category (syntax / data / EOF) with its line and column, and MUST NOT contain any
+  received byte. This is normative rather than stylistic because the body is `type`-tagged and
+  `serde_json` renders an unrecognised tag through plain `Display` — unquoted and unescaped — so
+  relaying its message verbatim lets one unauthenticated frame write a chosen line into the
+  receiver's log. `SafeText::describing_json_error` is the conforming rendering.
 
 ### 5.3 The four RPC methods (wire contract)
 
@@ -656,13 +662,27 @@ Defaults for `k` and `α` follow the canonical Kademlia paper (Maymounkov & Mazi
 
 | Variant | Meaning | Lookup impact |
 |---|---|---|
-| `Transport(String)` | Connect/stream/timeout failure talking to one peer | That peer is unreachable; lookup continues |
-| `MalformedResponse(String)` | A peer's response did not parse / match the request | As above |
-| `InvalidHex(String)` | A hex identifier supplied to the API was not valid 64-hex | Operation rejected |
+| `Transport(SafeText)` | Connect/stream/timeout failure talking to one peer | That peer is unreachable; lookup continues |
+| `MalformedResponse(SafeText)` | A peer's response did not parse / match the request | As above |
+| `InvalidHex(SafeText)` | A hex identifier supplied to the API was not valid 64-hex | Operation rejected |
 | `NoPeers` | Routing table + bootstrap set empty — no one to ask | Operation cannot run (see §9.2 for which ops return it) |
 | `Timeout` | An RPC exceeded its deadline | That peer is unreachable; lookup continues |
 
 Invariant: **no single peer failure is ever fatal to a lookup.**
+
+### 13.1 Untrusted text in errors (NORMATIVE, #1674 / #1675)
+
+- Every text-carrying `DhtError` variant carries a `dig_nat::SafeText`, **never** a `String`. A
+  `String` parameter accepts anything, so it invites a caller to embed what a peer sent and leaves the
+  crate's safety resting on a convention the type does not state. Implementations MUST make the
+  constraint structural in the same way.
+- A rendered `DhtError` **MUST NOT** contain U+000A, U+000D, any other control character, or any
+  bidirectional-formatting character originating from a remote party.
+- Text of remote origin MUST enter an error only through a constructor that NAMES that provenance
+  (`transport_from_untrusted`), which neutralizes it. `transport` accepts only a `&'static str` or an
+  existing `SafeText`.
+- `InvalidHex` names WHICH argument was non-canonical and **MUST NOT** echo the offending value: a
+  non-canonical identifier is by definition not one of ours.
 
 ## 14. Security properties
 

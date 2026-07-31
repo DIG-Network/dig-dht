@@ -16,7 +16,7 @@
 # in-memory transport harness (NO real network).
 [package]
 name = "dig-dht"
-version = "0.8.0"
+version = "0.9.0"
 edition = "2021"
 rust-version = "1.75.0"
 license = "Apache-2.0 OR MIT"
@@ -33,44 +33,32 @@ categories = ["network-programming"]
 # (this crate names no dig-nat connection type in any signature).
 #
 # Sourcing: dig-nat is published to crates.io, so we resolve the plain crates.io version (NC-7:
-# prefer the crates.io release over a bare-git source). `0.14` is purely ADDITIVE over 0.13 — it adds
-# `ChunkLensAssembler`, `ChunkLensError`, `MAX_RESOURCE_CHUNK_COUNT`, and
-# `RangeFrame::split_chunk_lens_pages`, removing and changing nothing. dig-dht touches none of those:
-# it references no `RangeFrame`/`RangeRequest`/`Availability*` type, and its own `encode()` calls are
-# its OWN `DhtRequest`/`DhtResponse` (`src/wire.rs`). So the bump is pinned-version only, with no
-# code change.
+# prefer the crates.io release over a bare-git source).
 #
-# The bump nonetheless MUST happen, and the reason is the semver arithmetic of a `0.x` crate.
-# The previous pin, `"0.13"`, means `>=0.13.0, <0.14.0` — a caret requirement on a `0.x` version treats the
-# MINOR as the breaking position, so a `^0.13` pin can NEVER resolve 0.14.0 no matter how additive
-# 0.14 actually is. A consumer that depends on dig-nat directly AND transitively through this crate
-# (dig-download does exactly that, through dig-dht and dig-peer) therefore resolves TWO dig-nat
-# copies and fails to compile with `E0308` on the now-split types. "dig-nat 0.14 is published" was
-# never the completion criterion for that cascade; "the consumer's lock resolves dig-nat SINGLY" is.
+# `0.15` is where `SafeText` lives, and this crate now uses it in every text-carrying `DhtError`
+# variant (#1675), so unlike the 0.13→0.14 bump this one is NOT pinned-version-only: `SafeText`
+# appears in dig-dht's own PUBLIC API. That makes the dig-nat version part of dig-dht's contract, and
+# a consumer that resolves a different dig-nat cannot name `DhtError::Transport`'s payload at all.
+#
+# The lockstep requirement from cascade #1668 therefore holds with MORE force, not less. A caret
+# requirement on a `0.x` version treats the MINOR as the breaking position, so a `^0.14` pin can
+# never resolve 0.15.0 however additive it is. A consumer that depends on dig-nat directly AND
+# transitively through this crate (dig-download does exactly that, through dig-dht and dig-peer)
+# would otherwise resolve TWO dig-nat copies — and now that a dig-nat type crosses dig-dht's API
+# boundary, that resolves to a hard `E0308` on `SafeText` rather than merely to two mTLS stacks.
+# "dig-nat 0.15 is published" is not the completion criterion; "every consumer's lock resolves
+# dig-nat SINGLY" is.
 #
 # 0.11 and 0.12 are SKIPPED deliberately for the same arithmetic: both are published but
 # semver-incompatible with each other, so no consumer could ever resolve 0.12 while pinning `0.11`.
 #
-# dig-dht's own consumers must upgrade to dig-nat 0.14 in lockstep — release-first cascade #1668.
-#
-# This release is a MINOR, and the honest justification is RUNTIME, not types. A consumer that took
-# it as a patch on `cargo update` while still pinning an older dig-nat would resolve two dig-nat
-# copies, and each copy carries its own mTLS stack and its own connection pool — so a single
-# `dig_dht` would dial through one and the consumer's own peer code through the other, doubling
-# handshakes and pooled connections to the same peers with neither side aware of the other. A minor
-# forces that coupling to be looked at deliberately; a patch would let it be acquired silently.
-#
-# What this is NOT is a type break, and the distinction matters enough to state precisely, because a
-# changelog carrying a false type-identity claim becomes the rule a later level of the cascade cites.
-# dig-nat owns no `PeerId` of its own — `dig-nat/src/lib.rs` re-exports it from dig-tls, and dig-nat
-# 0.13.0 and 0.14.0 BOTH require `dig-tls = "^0.3"` (verified against the crates.io index, not
-# assumed). Cargo therefore unifies both copies onto one dig-tls, and `dig_dht::PeerId` stays the
-# same type as `dig_nat::PeerId`. Every `dig_nat` reference in this crate is that `PeerId` or a doc
-# mention of `dig_nat::connect`; the DHT's own RPC (`DhtTransport::rpc`) carries no dig-nat-owned
-# type, so dig-dht's public API is unchanged by this bump. On type identity ALONE a patch would have
-# been semver-honest. A re-export list proves nothing about version coupling until you resolve where
-# each type is DEFINED.
-dig-nat = "0.14"
+# This release is a MINOR-and-breaking (`0.8`→`0.9`) on two counts, and both are honest type breaks
+# rather than the runtime-coupling argument that justified the last one: `DhtError`'s three
+# text-carrying variants changed payload type from `String` to `SafeText`, and `DhtError::transport`
+# no longer accepts a `String`. A consumer matching on `DhtError::Transport(s)` and using `s` as a
+# `String` must change. That is the intended cost: it is what makes raw peer text unrepresentable
+# rather than merely discouraged.
+dig-nat = "0.15"
 
 # Address-family (IPv6-first / IPv4-fallback) contract — the ecosystem's single source of truth for
 # `Family::of` classification (CLAUDE.md §5.2, epic #1020). The DHT derives the FAMILY half of its
@@ -103,3 +91,4 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"
 
 [profile.release]
 overflow-checks = true
+

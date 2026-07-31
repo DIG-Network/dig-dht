@@ -21,6 +21,7 @@
 
 use std::io;
 
+use dig_nat::SafeText;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt};
 
@@ -141,7 +142,24 @@ async fn decode_framed<T: for<'de> Deserialize<'de>, R: AsyncRead + Unpin>(
     }
     let mut body = vec![0u8; len];
     r.read_exact(&mut body).await?;
-    serde_json::from_slice(&body).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    serde_json::from_slice(&body).map_err(malformed_message)
+}
+
+/// Turn a `serde_json` decode failure on a PEER-SUPPLIED DHT message into an `io::Error` that says
+/// what went wrong without repeating what the peer sent (#1674).
+///
+/// [`DhtRequest`] and [`DhtResponse`] are internally tagged, and serde renders an unrecognised tag
+/// through plain `Display` — unquoted, unescaped. So `io::Error::new(InvalidData, e)` handed a
+/// stranger a direct write into the receiver's log: one frame, one forged line. The diagnosis is
+/// rebuilt from the error's category and position instead.
+fn malformed_message(error: serde_json::Error) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!(
+            "malformed dht message: {}",
+            SafeText::describing_json_error(&error)
+        ),
+    )
 }
 
 #[cfg(test)]
