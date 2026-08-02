@@ -33,7 +33,7 @@ use crate::content::ContentId;
 use crate::error::DhtError;
 use crate::key::Key;
 use crate::lookup::{iterative_find, QueryOutcome};
-use crate::provider_store::{ProviderStore, PutOutcome};
+use crate::provider_store::{ProviderSnapshot, ProviderStore, PutOutcome};
 use crate::record::{CandidateAddr, ProviderRecord};
 use crate::routing::{Contact, InsertOutcome, RoutingTable};
 use crate::transport::DhtTransport;
@@ -288,6 +288,21 @@ impl DhtService {
             .lock()
             .await
             .remove(content_key, provider_peer_id)
+    }
+
+    /// A bounded, AGGREGATED view of this node's provider store — content keys and their live
+    /// provider COUNTS, with no provider identities (dig_ecosystem #1935).
+    ///
+    /// Exposed so a node can answer the relay's RLY-009 `get_dht_records` without the caller needing
+    /// access to the store itself. Because a Kademlia node holds records for keys near its OWN
+    /// `peer_id`, this describes MANY OTHER peers' content rather than what this node caches — which
+    /// is what makes the union across nodes a usable view of the network's content layer.
+    ///
+    /// `max_keys` bounds the result; see [`ProviderStore::snapshot`] for the truncation and privacy
+    /// contract. Expired records are excluded as of the current time, so the counts agree with what
+    /// [`find_providers`](Self::find_providers) would actually return.
+    pub async fn provider_snapshot(&self, max_keys: usize) -> ProviderSnapshot {
+        self.providers.lock().await.snapshot(now_secs(), max_keys)
     }
 
     /// Actively retract THIS node's own provider record for `content`: remove the local record AND
@@ -719,5 +734,76 @@ mod tests {
     fn parse_key_rejects_bad_hex() {
         assert!(parse_key("nothex").is_none());
         assert!(parse_key(&"00".repeat(32)).is_some());
+    }
+}
+
+#[cfg(test)]
+mod provider_snapshot_tests {
+    use super::*;
+    use crate::record::CandidateAddr;
+
+    /// A transport that is never dialled: these tests only exercise the LOCAL provider store.
+    struct UnusedTransport;
+
+    #[async_trait::async_trait]
+    impl crate::transport::DhtTransport for UnusedTransport {
+        async fn rpc(
+            &self,
+            _from: &Contact,
+            _peer: &Contact,
+            _request: &DhtRequest,
+        ) -> Result<DhtResponse, DhtError> {
+            unreachable!("provider-snapshot tests never dial a peer")
+        }
+    }
+
+    fn service() -> DhtService {
+        DhtService::new(
+            PeerId::from_bytes([9u8; 32]),
+            vec![CandidateAddr::direct("h", 9444)],
+            DhtConfig::default(),
+            Arc::new(UnusedTransport),
+        )
+    }
+
+    async fn announce(svc: &DhtService, content_seed: u8, provider_seed: u8) {
+        let content = ContentId::store([content_seed; 32]);
+        svc.ingest_verified_provider(ProviderRecord::new(
+            &content.to_key(),
+            &PeerId::from_bytes([provider_seed; 32]),
+            vec![CandidateAddr::direct("h", 9444)],
+            now_secs() + 3600,
+        ))
+        .await;
+    }
+
+    /// The accessor RLY-009 answers from: counts reachable WITHOUT handing out the store, and
+    /// without a single provider identity crossing the boundary (dig_ecosystem #1935).
+    #[tokio::test]
+    async fn provider_snapshot_reports_counts_and_no_identities() {
+        let svc = service();
+        announce(&svc, 1, 7).await;
+
+        let snap = svc.provider_snapshot(100).await;
+
+        assert_eq!(snap.total_keys, 1);
+        assert_eq!(snap.entries[0].providers, 1);
+        assert!(
+            !format!("{snap:?}").contains(&PeerId::from_bytes([7u8; 32]).to_hex()),
+            "a provider identity must never leave the store through this accessor"
+        );
+    }
+
+    /// The bound is honoured: the store is attacker-influenced, so the answer size must be OURS.
+    #[tokio::test]
+    async fn provider_snapshot_honours_the_bound() {
+        let svc = service();
+        for i in 0..6u8 {
+            announce(&svc, i, 100 + i).await;
+        }
+        let snap = svc.provider_snapshot(2).await;
+        assert_eq!(snap.entries.len(), 2);
+        assert!(snap.truncated);
+        assert_eq!(snap.total_keys, 6, "the true total survives truncation");
     }
 }
