@@ -91,6 +91,28 @@ struct ProviderEntry {
     admitted_seq: u64,
 }
 
+/// One content key in a [`ProviderSnapshot`]: the key, and how many live providers this node knows
+/// for it. Deliberately carries NO provider identity — see [`ProviderStore::snapshot`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderSnapshotEntry {
+    /// The 64-hex content key.
+    pub content_key: String,
+    /// How many non-expired providers this node holds a record for.
+    pub providers: usize,
+}
+
+/// A bounded, aggregated view of a node's provider store — see [`ProviderStore::snapshot`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderSnapshot {
+    /// Content keys with at least one live provider, sorted by key, capped at the requested maximum.
+    pub entries: Vec<ProviderSnapshotEntry>,
+    /// How many keys had a live provider BEFORE the cap was applied, so a consumer can report
+    /// "showing N of M" rather than presenting a truncated view as complete.
+    pub total_keys: usize,
+    /// Whether the cap dropped entries.
+    pub truncated: bool,
+}
+
 /// A node's local provider records + the set of content keys it announces itself.
 #[derive(Debug)]
 pub struct ProviderStore {
@@ -331,6 +353,61 @@ impl ProviderStore {
         self.announced.iter().cloned().collect()
     }
 
+    /// A bounded, AGGREGATED view of what this node holds in its DHT provider store — content keys
+    /// and how many live providers each has, with no provider identities (dig_ecosystem #1935).
+    ///
+    /// This is what lets the relay show the network's content layer without joining the DHT: a
+    /// Kademlia node stores records for keys near its OWN `peer_id`, so these are records about
+    /// MANY OTHER peers' content, not a self-report of what this node caches. The union across
+    /// several nodes is a broad slice of the real DHT.
+    ///
+    /// # Why counts and not identities
+    ///
+    /// A provider record IS a `(peer_id, content_key)` pair — exactly the linkage the relay's `/map`
+    /// refuses to publish (its tests assert no `peer_id` and no raw IP ever appear). Returning
+    /// counts keeps that contract intact rather than carving an exception into it. A caller that
+    /// genuinely needs identities can still use [`get`](Self::get) per key.
+    ///
+    /// Expired records are excluded as of `now`, so the counts match what [`get`](Self::get) would
+    /// return rather than including records the store has not GC'd yet.
+    ///
+    /// `max_keys` bounds the result: the store is attacker-influenced (any peer can announce), so an
+    /// unbounded snapshot would let a Sybil dictate the response size. When the cap truncates,
+    /// [`ProviderSnapshot::truncated`] is set and `total_keys` still reports the true total, so a
+    /// consumer can say "showing N of M" instead of silently presenting a partial view as complete.
+    /// `max_keys == 0` yields no entries but still reports `total_keys`.
+    pub fn snapshot(&self, now: u64, max_keys: usize) -> ProviderSnapshot {
+        let mut entries: Vec<ProviderSnapshotEntry> = self
+            .by_key
+            .iter()
+            .filter_map(|(content_key, providers)| {
+                let live = providers
+                    .values()
+                    .filter(|e| !e.record.is_expired(now))
+                    .count();
+                // A key whose every record has expired is not part of the view.
+                (live > 0).then(|| ProviderSnapshotEntry {
+                    content_key: content_key.clone(),
+                    providers: live,
+                })
+            })
+            .collect();
+
+        // Deterministic order so the same store yields the same snapshot, and so truncation takes a
+        // stable subset rather than an arbitrary one from HashMap iteration order.
+        entries.sort_by(|a, b| a.content_key.cmp(&b.content_key));
+
+        let total_keys = entries.len();
+        let truncated = total_keys > max_keys;
+        entries.truncate(max_keys);
+
+        ProviderSnapshot {
+            entries,
+            total_keys,
+            truncated,
+        }
+    }
+
     /// Total live+stale records across all keys (diagnostics / tests).
     pub fn len(&self) -> usize {
         self.by_key.values().map(|p| p.len()).sum()
@@ -361,6 +438,99 @@ mod tests {
             vec![CandidateAddr::direct("h", 9444)],
             expires_at,
         )
+    }
+
+    // -- #1935: the aggregated snapshot the relay's /dht endpoint is built on -----------------
+
+    #[test]
+    fn snapshot_counts_live_providers_per_key_and_never_leaks_an_identity() {
+        // The privacy property is the point: a provider record IS (peer_id, content_key), which is
+        // exactly the linkage the relay's /map refuses to publish. The snapshot must carry counts.
+        let mut s = ProviderStore::new();
+        let k1 = Key::from_bytes([1u8; 32]);
+        let k2 = Key::from_bytes([2u8; 32]);
+        s.put(rec(&k1, 10, NOW + 100));
+        s.put(rec(&k1, 11, NOW + 100));
+        s.put(rec(&k2, 12, NOW + 100));
+
+        let snap = s.snapshot(NOW, 100);
+
+        assert_eq!(snap.total_keys, 2);
+        assert!(!snap.truncated);
+        let counts: Vec<usize> = snap.entries.iter().map(|e| e.providers).collect();
+        assert_eq!(counts, vec![2, 1], "two providers for k1, one for k2");
+
+        // Nothing in the snapshot may be a provider peer_id. Assert structurally rather than by
+        // string-matching, so the property cannot rot when a field is added.
+        let rendered = format!("{snap:?}");
+        for provider in [10u8, 11, 12] {
+            let pid = PeerId::from_bytes([provider; 32]).to_hex();
+            assert!(
+                !rendered.contains(&pid),
+                "provider identity {pid} must never appear in a snapshot"
+            );
+        }
+    }
+
+    #[test]
+    fn snapshot_excludes_expired_records_and_keys_left_with_none() {
+        // Must agree with `get`, which also filters on expiry — otherwise the relay would advertise
+        // providers the node would not actually return.
+        let mut s = ProviderStore::new();
+        let live = Key::from_bytes([1u8; 32]);
+        let dead = Key::from_bytes([2u8; 32]);
+        s.put(rec(&live, 10, NOW + 100));
+        s.put(rec(&dead, 11, NOW + 1));
+
+        let snap = s.snapshot(NOW + 50, 100);
+
+        assert_eq!(
+            snap.total_keys, 1,
+            "the fully-expired key drops out entirely"
+        );
+        assert_eq!(snap.entries[0].providers, 1);
+        assert_eq!(
+            snap.entries[0].content_key,
+            live.to_hex(),
+            "the surviving key is the live one"
+        );
+    }
+
+    #[test]
+    fn snapshot_is_bounded_and_reports_the_true_total_when_truncated() {
+        // The store is attacker-influenced — any peer can announce — so an unbounded snapshot would
+        // let a Sybil dictate the response size. Truncation must be VISIBLE, not silent.
+        let mut s = ProviderStore::new();
+        for i in 0..10u8 {
+            s.put(rec(&Key::from_bytes([i; 32]), 100 + i, NOW + 100));
+        }
+
+        let snap = s.snapshot(NOW, 3);
+
+        assert_eq!(snap.entries.len(), 3);
+        assert!(snap.truncated);
+        assert_eq!(snap.total_keys, 10, "the true total survives truncation");
+    }
+
+    #[test]
+    fn snapshot_is_deterministic_so_truncation_takes_a_stable_subset() {
+        // HashMap iteration order is arbitrary; without sorting, two calls could return different
+        // subsets and a consumer polling the relay would see content flicker in and out.
+        let mut s = ProviderStore::new();
+        for i in 0..8u8 {
+            s.put(rec(&Key::from_bytes([i; 32]), 100 + i, NOW + 100));
+        }
+        assert_eq!(s.snapshot(NOW, 4), s.snapshot(NOW, 4));
+    }
+
+    #[test]
+    fn a_zero_cap_yields_no_entries_but_still_reports_the_total() {
+        let mut s = ProviderStore::new();
+        s.put(rec(&Key::from_bytes([1u8; 32]), 10, NOW + 100));
+        let snap = s.snapshot(NOW, 0);
+        assert!(snap.entries.is_empty());
+        assert!(snap.truncated);
+        assert_eq!(snap.total_keys, 1);
     }
 
     #[test]

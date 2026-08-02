@@ -287,6 +287,22 @@ Every node keeps a local provider store, which MUST behave as:
   (same `content_key` + same `provider_peer_id`) MUST always succeed regardless of capacity — it
   does not grow the store.
 - **TTL-filtered reads:** `get` returns only records live at the supplied `now`.
+- **Aggregated snapshot (`snapshot`).** The store MUST expose a bounded, observability-only view of
+  what it holds: each `content_key` with at least one live provider, and the COUNT of live providers
+  for it. This is what lets an observer (the relay's `/dht` endpoint, dig_ecosystem #1935) see the
+  network's content layer without joining the DHT — a node stores records for keys near its OWN
+  `peer_id`, so these describe many other peers' content, not the node's own holdings.
+  - It MUST report counts, **never provider identities**. A provider record is a
+    `(peer_id, content_key)` pair, and publishing that linkage is precisely what the relay's `/map`
+    privacy contract forbids; a caller needing identities uses `get` per key.
+  - It MUST exclude records expired at the supplied `now`, so it agrees with `get`, and MUST omit a
+    key whose every record has expired.
+  - It MUST be bounded by a caller-supplied maximum, and MUST report both the true pre-truncation
+    total and whether truncation occurred, so a partial view is never presented as complete. The
+    store is attacker-influenced — any peer may `add_provider` — so an unbounded snapshot would let
+    a Sybil dictate the response size.
+  - It MUST be deterministic (ordered by `content_key`), so repeated calls on an unchanged store
+    return the same subset rather than flickering with hash-map iteration order.
 - **GC:** expired records (and content keys left with no live providers) are removed; GC returns
   the number of records dropped.
 - **Bounded admission control (`put`).** A genuinely new `(content_key, provider_peer_id)` pair is
