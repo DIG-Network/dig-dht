@@ -16,7 +16,7 @@
 # in-memory transport harness (NO real network).
 [package]
 name = "dig-dht"
-version = "0.10.0"
+version = "0.11.0"
 edition = "2021"
 rust-version = "1.75.0"
 license = "Apache-2.0 OR MIT"
@@ -58,7 +58,7 @@ categories = ["network-programming"]
 # no longer accepts a `String`. A consumer matching on `DhtError::Transport(s)` and using `s` as a
 # `String` must change. That is the intended cost: it is what makes raw peer text unrepresentable
 # rather than merely discouraged.
-dig-nat = "0.15"
+dig-nat = "0.18"
 
 # Address-family (IPv6-first / IPv4-fallback) contract — the ecosystem's single source of truth for
 # `Family::of` classification (CLAUDE.md §5.2, epic #1020). The DHT derives the FAMILY half of its
