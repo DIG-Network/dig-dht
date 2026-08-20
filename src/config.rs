@@ -147,8 +147,7 @@ mod tests {
         assert!(c.discovery_cache_limits.max_providers_per_key > 0);
         assert!(c.discovery_cache_limits.max_total_records > 0);
         assert!(
-            c.discovery_cache_limits.max_total_records
-                < c.provider_store_limits.max_total_records
+            c.discovery_cache_limits.max_total_records < c.provider_store_limits.max_total_records
         );
     }
 

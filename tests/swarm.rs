@@ -1245,7 +1245,11 @@ async fn a_cached_provider_is_never_re_served_to_another_peer() {
     holder.announce_provider(&content).await.unwrap();
 
     let found = seeker.find_providers(&content).await.unwrap();
-    assert_eq!(found.len(), 1, "control: the seeker did discover the holder");
+    assert_eq!(
+        found.len(),
+        1,
+        "control: the seeker did discover the holder"
+    );
     assert!(
         !seeker.cached_providers(&content).await.is_empty(),
         "control: and it cached what it learned - without a cache the rest is vacuous"
