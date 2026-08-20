@@ -941,6 +941,9 @@ struct CannedAnswer {
 struct StampingTransport {
     /// peer_id (64-hex) → that peer's canned answer. A peer with no script is unreachable.
     answers: HashMap<String, CannedAnswer>,
+    /// Outbound RPCs this double has carried, so a test can assert a lookup reached the network
+    /// (or did not) by MEASURING it rather than inferring it from the answer.
+    rpcs: Arc<AtomicUsize>,
 }
 
 #[async_trait]
@@ -951,6 +954,7 @@ impl DhtTransport for StampingTransport {
         peer: &Contact,
         request: &DhtRequest,
     ) -> Result<DhtResponse, DhtError> {
+        self.rpcs.fetch_add(1, Ordering::SeqCst);
         let Some(answer) = self.answers.get(&peer.peer_id) else {
             return Err(DhtError::transport("no route"));
         };
@@ -982,7 +986,10 @@ async fn scripted_seeker(
         pid(0x11, 0x01),
         addr(),
         DhtConfig::default(),
-        Arc::new(StampingTransport { answers }),
+        Arc::new(StampingTransport {
+            answers,
+            rpcs: Arc::new(AtomicUsize::new(0)),
+        }),
     ));
     for peer in known {
         seeker.add_peer(peer, addr()).await;
@@ -998,6 +1005,7 @@ async fn seeker_against_stamping_peer(answer_content_key: String) -> Arc<DhtServ
         addr(),
         DhtConfig::default(),
         Arc::new(StampingTransport {
+            rpcs: Arc::new(AtomicUsize::new(0)),
             answers: HashMap::from([(
                 responder.to_hex(),
                 CannedAnswer {
@@ -1182,5 +1190,218 @@ async fn a_second_lookup_for_the_same_content_makes_no_network_round_trips() {
     assert!(
         second[0].best_address().is_some(),
         "a cached record must still carry a dialable address, or it cannot skip rediscovery"
+    );
+}
+
+/// Wall-clock Unix seconds, for pinning a cached record's clamped expiry from both sides.
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// A [`scripted_seeker`] that also hands back the double's RPC counter.
+async fn counting_scripted_seeker(
+    known: &[PeerId],
+    answers: HashMap<String, CannedAnswer>,
+) -> (Arc<DhtService>, Arc<AtomicUsize>) {
+    let rpcs = Arc::new(AtomicUsize::new(0));
+    let seeker = Arc::new(DhtService::new(
+        pid(0x11, 0x01),
+        addr(),
+        DhtConfig::default(),
+        Arc::new(StampingTransport {
+            answers,
+            rpcs: rpcs.clone(),
+        }),
+    ));
+    for peer in known {
+        seeker.add_peer(peer, addr()).await;
+    }
+    (seeker, rpcs)
+}
+
+/// The property the whole two-store split exists for: a record this node learned by ASKING is
+/// hearsay, and hearsay must never become this node's own claim about who holds what.
+///
+/// **This is a PLACEMENT test, so it is built so that relocating the cache changes the observable
+/// result.** The nearest wrong implementation is the obvious one — cache into the store the node
+/// already has — and every assertion here is chosen because that implementation flips it: a merged
+/// store makes the seeker answer the stranger with the holder, and makes the holder's key appear in
+/// `provider_snapshot`. The two authoritative holders are taken OFFLINE first so the seeker's cache
+/// is the only surviving source in the swarm; without that, the stranger reaches the real holder
+/// legitimately and the assertion measures the topology instead of the split.
+///
+/// The `cached_providers` control is what stops the reverse false green: an implementation with no
+/// cache at all also serves the stranger nothing, and would pass every other line here.
+#[tokio::test]
+async fn a_cached_provider_is_never_re_served_to_another_peer() {
+    let router = SwarmRouter::new();
+    let config = DhtConfig::default();
+    let (holder, middle, seeker) = holder_middle_seeker(&router, &config).await;
+
+    let content = ContentId::capsule([0xA1; 32], [0xB2; 32]);
+    holder.announce_provider(&content).await.unwrap();
+
+    let found = seeker.find_providers(&content).await.unwrap();
+    assert_eq!(found.len(), 1, "control: the seeker did discover the holder");
+    assert!(
+        !seeker.cached_providers(&content).await.is_empty(),
+        "control: and it cached what it learned - without a cache the rest is vacuous"
+    );
+
+    // Everyone holding the record AUTHORITATIVELY goes dark, so the only node in the swarm that
+    // still knows the holder is the seeker, and only out of its cache.
+    router.set_offline(&holder.local_id().to_hex()).await;
+    router.set_offline(&middle.local_id().to_hex()).await;
+
+    let stranger = make_node(&router, pid(0x44, 4), config.clone()).await;
+    stranger.add_peer(seeker.local_id(), addr()).await;
+
+    let answer = stranger.find_providers(&content).await.unwrap();
+    assert!(
+        answer.is_empty(),
+        "a cached record must never be re-served on an inbound find_providers, got {answer:?}"
+    );
+
+    let snap = seeker.provider_snapshot(100).await;
+    assert_eq!(
+        snap.total_keys, 0,
+        "nor leak through provider_snapshot, which reports the authoritative store only"
+    );
+}
+
+/// The escape hatch the cache's one added exposure depends on, so it is pinned by a test.
+///
+/// A lookup early-exits on the first on-key answer, so a lying first hop could always return a
+/// fabricated provider set; caching makes that answer STICKY for the cache TTL.
+/// `forget_discovered` is what bounds it, and an escape hatch that silently did nothing would leave
+/// the caller with no way back to the network at all — which is worse than not caching.
+#[tokio::test]
+async fn forgetting_a_cached_answer_sends_the_next_lookup_back_to_the_network() {
+    let router = SwarmRouter::new();
+    let config = DhtConfig::default();
+    let (holder, _middle, seeker) = holder_middle_seeker(&router, &config).await;
+
+    let content = ContentId::capsule([0xC3; 32], [0xD4; 32]);
+    holder.announce_provider(&content).await.unwrap();
+    seeker.find_providers(&content).await.unwrap();
+
+    router.reset_rpcs();
+    seeker.find_providers(&content).await.unwrap();
+    assert_eq!(
+        router.rpc_count(),
+        0,
+        "control: without the forget, a repeat lookup stays local"
+    );
+
+    assert_eq!(
+        seeker.forget_discovered(&content).await,
+        1,
+        "the one cached record is dropped, and the count is reported"
+    );
+
+    router.reset_rpcs();
+    let again = seeker.find_providers(&content).await.unwrap();
+    assert!(
+        router.rpc_count() > 0,
+        "a forgotten key must walk the DHT again rather than answer from a cache it no longer has"
+    );
+    assert_eq!(again.len(), 1, "and the fresh walk still finds the holder");
+}
+
+/// Admission rule 3: a peer cannot buy itself a longer stay in this node's cache by claiming a
+/// distant expiry. The scripted double answers with `expires_at: u64::MAX` — the maximal version of
+/// that lie — and the cached copy must come back clamped to `now + discovery_cache_ttl`.
+///
+/// Pinned from BOTH sides. An upper bound alone is satisfied by clamping to any value at all,
+/// including one so short the cache never pays for itself; the lower bound is what says the clamp
+/// is the configured TTL rather than an accident.
+#[tokio::test]
+async fn a_cached_record_expiry_is_clamped_down_to_the_discovery_cache_ttl() {
+    let wanted = ContentId::store([0xA1; 32]);
+    let responder = pid(0xEE, 0x01);
+    let seeker = scripted_seeker(
+        &[responder],
+        HashMap::from([(
+            responder.to_hex(),
+            CannedAnswer {
+                stamped_key: StampedKey::Queried,
+                provider: responder,
+                closer: vec![],
+            },
+        )]),
+    )
+    .await;
+
+    let before = unix_now();
+    let found = seeker.find_providers(&wanted).await.unwrap();
+    assert_eq!(found.len(), 1, "the record is returned to the caller");
+    assert_eq!(
+        found[0].expires_at,
+        u64::MAX,
+        "fixture control: the peer really did claim a forever expiry"
+    );
+
+    let cached = seeker.cached_providers(&wanted).await;
+    assert_eq!(cached.len(), 1, "and it was cached");
+
+    let ttl = DhtConfig::default().discovery_cache_ttl_secs();
+    assert!(
+        cached[0].expires_at <= before + ttl + 2,
+        "clamped DOWN to the cache TTL, got {} against a ceiling of {}",
+        cached[0].expires_at,
+        before + ttl
+    );
+    assert!(
+        cached[0].expires_at + 2 >= before + ttl,
+        "and clamped to the TTL rather than to something arbitrarily shorter, got {}",
+        cached[0].expires_at
+    );
+}
+
+/// Admission rule 1, and the reason it is a rule rather than an optimisation.
+///
+/// A record naming THIS node is useless as a dial target, so caching it would be merely wasteful —
+/// except that a non-empty cache SUPPRESSES the next real lookup. The second half of this test is
+/// the one that matters: a peer that echoes our own id back at us must not be able to pin us to a
+/// provider set of one entry we cannot use. An assertion that only checked the cache was empty
+/// would pass against an implementation that skipped the record but still short-circuited.
+#[tokio::test]
+async fn a_record_naming_this_node_is_never_cached() {
+    let wanted = ContentId::store([0xA1; 32]);
+    let responder = pid(0xEE, 0x01);
+    let echoed_self = pid(0x11, 0x01);
+
+    let (seeker, rpcs) = counting_scripted_seeker(
+        &[responder],
+        HashMap::from([(
+            responder.to_hex(),
+            CannedAnswer {
+                stamped_key: StampedKey::Queried,
+                provider: echoed_self,
+                closer: vec![],
+            },
+        )]),
+    )
+    .await;
+    assert_eq!(
+        seeker.local_id().to_hex(),
+        echoed_self.to_hex(),
+        "fixture: the scripted peer echoes OUR OWN id back as the holder"
+    );
+
+    seeker.find_providers(&wanted).await.unwrap();
+    assert!(
+        seeker.cached_providers(&wanted).await.is_empty(),
+        "our own id is not a dial target and must not enter the cache"
+    );
+
+    rpcs.store(0, Ordering::SeqCst);
+    seeker.find_providers(&wanted).await.unwrap();
+    assert!(
+        rpcs.load(Ordering::SeqCst) > 0,
+        "so an echoed self-record cannot pin this node to a provider set it cannot use"
     );
 }
