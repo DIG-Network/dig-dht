@@ -14,6 +14,7 @@
 //! direct in-process call.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -29,6 +30,11 @@ use dig_dht::{BootstrapPeer, CandidateAddr, ContentId, DhtConfig, DhtError, DhtS
 struct SwarmRouter {
     nodes: Arc<RwLock<HashMap<String, Arc<DhtService>>>>,
     offline: Arc<RwLock<HashMap<String, ()>>>,
+    /// Every outbound RPC the swarm carries. A test that asserts a call made ZERO network
+    /// round-trips needs to OBSERVE the network, not infer its absence from the answer: a lookup
+    /// that walks an honest, reachable swarm returns the same providers a cache hit would, so the
+    /// result alone cannot tell the two apart.
+    rpcs: Arc<AtomicUsize>,
 }
 
 impl SwarmRouter {
@@ -45,6 +51,16 @@ impl SwarmRouter {
 
     async fn set_offline(&self, peer_id: &str) {
         self.offline.write().await.insert(peer_id.to_string(), ());
+    }
+
+    /// How many outbound RPCs the swarm has carried since the last [`Self::reset_rpcs`].
+    fn rpc_count(&self) -> usize {
+        self.rpcs.load(Ordering::SeqCst)
+    }
+
+    /// Zero the RPC counter, so the next assertion measures exactly one operation.
+    fn reset_rpcs(&self) {
+        self.rpcs.store(0, Ordering::SeqCst);
     }
 
     fn transport(&self) -> Arc<dyn DhtTransport> {
@@ -67,6 +83,7 @@ impl DhtTransport for RouterTransport {
         peer: &Contact,
         request: &DhtRequest,
     ) -> Result<DhtResponse, DhtError> {
+        self.router.rpcs.fetch_add(1, Ordering::SeqCst);
         if self.router.offline.read().await.contains_key(&peer.peer_id) {
             return Err(DhtError::transport("offline"));
         }
@@ -1101,5 +1118,69 @@ async fn a_mismatched_answer_does_not_end_the_lookup_early() {
     assert!(
         seeker.find_providers(&wanted).await.unwrap().is_empty(),
         "a near-miss content_key is still not the queried key"
+    );
+}
+
+// ---- Requirement 7: lookup-result caching (dig_ecosystem#3128) --------------------------------
+
+/// A three-node line — holder `H` ⟷ middle `M` ⟷ seeker `S` — in which `S` can only learn about
+/// `H` by asking `M`.
+///
+/// The wiring is deliberately one-directional at announce time: `M` knows only `H`, so the
+/// announce PUT converges on `M` alone and `S` NEVER receives an `add_provider`. That is what keeps
+/// `S`'s AUTHORITATIVE provider store empty for the key, so anything `S` can answer on a second
+/// lookup came from what it learned during the first one — not from a record it was handed.
+async fn holder_middle_seeker(
+    router: &SwarmRouter,
+    config: &DhtConfig,
+) -> (Arc<DhtService>, Arc<DhtService>, Arc<DhtService>) {
+    let holder = make_node(router, pid(0x11, 1), config.clone()).await;
+    let middle = make_node(router, pid(0x22, 2), config.clone()).await;
+    let seeker = make_node(router, pid(0x33, 3), config.clone()).await;
+
+    holder.add_peer(middle.local_id(), addr()).await;
+    middle.add_peer(holder.local_id(), addr()).await;
+    seeker.add_peer(middle.local_id(), addr()).await;
+
+    (holder, middle, seeker)
+}
+
+/// Requirement 7: a second lookup for content already discovered is served from the local cache and
+/// makes NO network round-trips.
+///
+/// **The fixture keeps the swarm honest and fully reachable for the second lookup.** A network that
+/// had been taken offline would let a cache-less implementation fail loudly and look like a pass for
+/// the wrong reason; with the network still able to answer, an uncached second lookup succeeds
+/// identically — so the ONLY thing the zero-RPC assertion can be measuring is the cache.
+#[tokio::test]
+async fn a_second_lookup_for_the_same_content_makes_no_network_round_trips() {
+    let router = SwarmRouter::new();
+    let config = DhtConfig::default();
+    let (holder, _middle, seeker) = holder_middle_seeker(&router, &config).await;
+
+    let content = ContentId::capsule([0xA1; 32], [0xB2; 32]);
+    holder.announce_provider(&content).await.unwrap();
+
+    router.reset_rpcs();
+    let first = seeker.find_providers(&content).await.unwrap();
+    assert_eq!(first.len(), 1, "the seeker discovers the holder through M");
+    assert_eq!(first[0].provider_peer_id, holder.local_id().to_hex());
+    assert!(
+        router.rpc_count() > 0,
+        "control: the FIRST lookup genuinely required the network"
+    );
+
+    router.reset_rpcs();
+    let second = seeker.find_providers(&content).await.unwrap();
+    assert_eq!(
+        router.rpc_count(),
+        0,
+        "requirement 7: the second lookup is served from the cache without rediscovery"
+    );
+    assert_eq!(second.len(), 1, "and it still answers with the holder");
+    assert_eq!(second[0].provider_peer_id, holder.local_id().to_hex());
+    assert!(
+        second[0].best_address().is_some(),
+        "a cached record must still carry a dialable address, or it cannot skip rediscovery"
     );
 }
