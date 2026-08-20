@@ -73,7 +73,16 @@ pub struct DhtService {
     local_addresses: Vec<CandidateAddr>,
     config: DhtConfig,
     routing: Arc<Mutex<RoutingTable>>,
+    /// The AUTHORITATIVE provider store — records whose provider attribution this node established
+    /// (its own announces, the mTLS-checked serving-side `add_provider`, the caller-verified
+    /// [`ingest_verified_provider`](DhtService::ingest_verified_provider)). This is the store that
+    /// answers an inbound `find_providers`, so everything in it becomes THIS NODE'S CLAIM about who
+    /// holds what.
     providers: Arc<Mutex<ProviderStore>>,
+    /// The DISCOVERY CACHE — records this node collected from its OWN lookups (SPEC §6.8). Same
+    /// type, same admission control, different trust provenance and therefore a different store:
+    /// see [`cache_discovered`](DhtService::cache_discovered) for why these two must never be one.
+    discovered: Arc<Mutex<ProviderStore>>,
     transport: Arc<dyn DhtTransport>,
 }
 
@@ -88,12 +97,14 @@ impl DhtService {
     ) -> Self {
         let routing = RoutingTable::new(&local_id, config.k);
         let providers = ProviderStore::with_limits(config.provider_store_limits);
+        let discovered = ProviderStore::with_limits(config.discovery_cache_limits);
         DhtService {
             local_id,
             local_addresses,
             config,
             routing: Arc::new(Mutex::new(routing)),
             providers: Arc::new(Mutex::new(providers)),
+            discovered: Arc::new(Mutex::new(discovered)),
             transport,
         }
     }
@@ -168,10 +179,25 @@ impl DhtService {
         Ok(result.closest)
     }
 
-    /// Find the providers of `content` — the peers holding it. Runs an iterative `find_providers`
-    /// lookup toward the content key, returning every live provider record collected (deduped by
-    /// provider). The node then connects to those providers over dig-nat and fetches via the L7 peer
-    /// RPC.
+    /// Find the providers of `content` — the peers holding it. Answers from this node's
+    /// **discovery cache** when a recent lookup for the same key is still live (SPEC §6.8);
+    /// otherwise runs an iterative `find_providers` lookup toward the content key, caches what it
+    /// learns, and returns every live provider record collected (deduped by provider). The node
+    /// then connects to those providers over dig-nat and fetches via the L7 peer RPC.
+    ///
+    /// **Cached answers are what make a later direct dial free** (dig_ecosystem#3128 requirement 7):
+    /// a `.dig` fetch issues many requests against the same store, and without the cache each one
+    /// paid a fresh Kademlia walk. A live cache entry is treated as evidence that this node
+    /// completed a lookup for the key recently, so the walk is skipped entirely — records this node
+    /// holds AUTHORITATIVELY are deliberately NOT such evidence, since they may be its own announce
+    /// and short-circuiting on them would stop a publisher ever learning the other holders of its
+    /// own content.
+    ///
+    /// A cached holder is a claim by an untrusted peer, so a dial to it may fail. That costs one
+    /// failed dial, never a wrong answer — the content is accepted because it verifies against the
+    /// merkle root, never because a peer supplied it (NC-12). A caller that finds every cached
+    /// candidate undialable calls [`forget_discovered`](Self::forget_discovered) and asks again,
+    /// which re-runs the full walk.
     ///
     /// Returns an empty vec (not an error) when the content simply has no known providers; returns
     /// [`DhtError::NoPeers`] only when there is no one to ask (empty routing table + no bootstrap).
@@ -180,10 +206,16 @@ impl DhtService {
         content: &ContentId,
     ) -> Result<Vec<ProviderRecord>, DhtError> {
         let target = content.to_key();
+        let key_hex = target.to_hex();
 
         // Local short-circuit: if we already hold providers for this key, include them.
         let now = now_secs();
-        let mut local = self.providers.lock().await.get(&target.to_hex(), now);
+        let local = self.providers.lock().await.get(&key_hex, now);
+
+        let cached = self.discovered.lock().await.get(&key_hex, now);
+        if !cached.is_empty() {
+            return Ok(merge_dedup_by_provider(local, cached, now));
+        }
 
         let seeds = self.seed_contacts(&target).await;
         if seeds.is_empty() {
@@ -193,20 +225,57 @@ impl DhtService {
         let result = self.run_lookup(target, seeds, true).await;
         self.absorb_contacts(&result.closest).await;
 
-        // Merge local + discovered, dedup by provider, drop expired. Discovered records come
-        // straight off the wire from other peers' responses, bypassing `ProviderRecord::new`'s
-        // address cap — capped here before handing them back to our caller (SPEC §5.5, §14).
-        // Records for a key we did not query were already discarded at the wire boundary in
-        // `run_lookup`'s query closure (SPEC §6.7), so every record here is for `target`.
+        // Discovered records come straight off the wire from other peers' responses, bypassing
+        // `ProviderRecord::new`'s address cap — capped here before they are cached or handed back
+        // to our caller (SPEC §5.5, §14). Records for a key we did not query were already discarded
+        // at the wire boundary in `run_lookup`'s query closure (SPEC §6.7).
         let mut discovered = result.providers;
         for r in &mut discovered {
             crate::record::sort_and_cap_addresses(&mut r.addresses);
         }
-        local.extend(discovered);
-        let now = now_secs();
-        let mut seen = std::collections::HashSet::new();
-        local.retain(|r| !r.is_expired(now) && seen.insert(r.provider_peer_id.clone()));
-        Ok(local)
+        self.cache_discovered(&key_hex, &discovered).await;
+
+        Ok(merge_dedup_by_provider(local, discovered, now_secs()))
+    }
+
+    /// The provider records this node has CACHED for `content` from its own lookups, live as of
+    /// now — the direct-dial shortcut requirement 7 exists to provide, with no network round-trip
+    /// and no fallback walk.
+    ///
+    /// # These records MUST NOT be re-served to anyone
+    ///
+    /// They are hearsay: some peer along a lookup said that some other peer holds this content, and
+    /// nothing authenticated that claim — unlike an authoritative record, which either names the
+    /// mTLS-verified caller that announced it or was signature-checked by the caller of
+    /// [`ingest_verified_provider`](Self::ingest_verified_provider). Hearsay belongs on the FETCH
+    /// path, where a wrong candidate is merely a wasted dial because the merkle bind catches it. On
+    /// the ASSERTION path — an inbound `find_providers`, a redirect answer, anything a stranger
+    /// reads — it becomes THIS NODE'S claim about the world, and re-serving it would launder an
+    /// attacker's fabricated holder into an answer other nodes trust. This node therefore never
+    /// serves the cache (see [`handle_request_from`](Self::handle_request_from), which reads the
+    /// authoritative store only) and never publishes it (see
+    /// [`provider_snapshot`](Self::provider_snapshot)).
+    pub async fn cached_providers(&self, content: &ContentId) -> Vec<ProviderRecord> {
+        self.discovered
+            .lock()
+            .await
+            .get(&content.to_key().to_hex(), now_secs())
+    }
+
+    /// Forget every cached provider for `content`, so the next
+    /// [`find_providers`](Self::find_providers) runs a real lookup again. Returns how many cached
+    /// records were dropped.
+    ///
+    /// This is what keeps a cache miss CHEAP and keeps it from being mistaken for absence: a caller
+    /// that has tried every cached candidate and reached none of them calls this and asks again,
+    /// rather than concluding the content has no providers. It touches only this node's own cache —
+    /// never the authoritative store, so it can neither censor a key this node serves nor be
+    /// observed by any other peer.
+    pub async fn forget_discovered(&self, content: &ContentId) -> usize {
+        self.discovered
+            .lock()
+            .await
+            .remove_key(&content.to_key().to_hex())
     }
 
     /// Announce that THIS node holds `content`: build a provider record (this node's `peer_id` +
@@ -384,10 +453,17 @@ impl DhtService {
         count
     }
 
-    /// Drop expired provider records. Call periodically (piggy-backs on republish/refresh). Returns
-    /// the number of records removed.
+    /// Drop expired provider records from BOTH the authoritative store and the discovery cache
+    /// (SPEC §6.8). Call periodically (piggy-backs on republish/refresh). Returns the total number
+    /// of records removed.
+    ///
+    /// One `now` for both sweeps, so a maintenance tick cannot leave the two stores disagreeing
+    /// about which instant it ran at.
     pub async fn gc(&self) -> usize {
-        self.providers.lock().await.gc(now_secs())
+        let now = now_secs();
+        let authoritative = self.providers.lock().await.gc(now);
+        let cached = self.discovered.lock().await.gc(now);
+        authoritative + cached
     }
 
     /// Ping a peer for liveness; on failure, evict it from the routing table. Used by the
@@ -541,6 +617,57 @@ impl DhtService {
         outcome
     }
 
+    /// Cache the records a lookup for `content_key` collected, so a later fetch of the same content
+    /// can dial directly instead of walking the DHT again (SPEC §6.8, dig_ecosystem#3128 req 7).
+    ///
+    /// # Why this is a SEPARATE store from the authoritative one
+    ///
+    /// The two hold the same type and are admission-controlled by the same code, but they carry
+    /// different trust provenance, and the difference decides who may read them. An authoritative
+    /// record was attributed — the serving side checked the announcing record against its
+    /// mTLS-verified caller, or the caller of `ingest_verified_provider` checked the holder's
+    /// signature. A record collected during a lookup was attributed by NOBODY: an arbitrary peer
+    /// along the walk asserted that some third party holds the content, at addresses of its
+    /// choosing. Merging the two would make this node re-serve that assertion as its own on every
+    /// inbound `find_providers` — turning one fabricated record fed to one node into a poisoned
+    /// answer the rest of the network reads back, at a keyspace position this node has no `k`-closest
+    /// duty over. Kept apart, the worst a fabricated record achieves is a wasted dial by the one
+    /// node that cached it.
+    ///
+    /// Three admission rules, in order:
+    ///
+    /// 1. **Never cache a record naming THIS node.** It is useless as a dial target, and worse, it
+    ///    would make the cache non-empty and so suppress the next real lookup — a peer that echoed
+    ///    our own record back at us could pin us to a provider set of one entry we cannot use.
+    /// 2. **Never cache a record for a different key.** The wire boundary already discards those
+    ///    (SPEC §6.7); re-checking costs a string compare and this write outlives the lookup that
+    ///    produced it, so the invariant is asserted rather than assumed.
+    /// 3. **Clamp the expiry DOWN to `now + discovery_cache_ttl`**, never up. A peer cannot extend
+    ///    its residence in this node's cache by claiming a distant expiry, and a record that is
+    ///    already expired is not cached at all.
+    ///
+    /// Every surviving record goes through [`ProviderStore::put_at`], so the discovery cache's
+    /// per-key and global caps bound it exactly as the authoritative store's bound that one — this
+    /// write path has no way to exceed them.
+    async fn cache_discovered(&self, content_key: &str, discovered: &[ProviderRecord]) {
+        let now = now_secs();
+        let ceiling = now.saturating_add(self.config.discovery_cache_ttl_secs());
+        let self_id = self.local_id.to_hex();
+
+        let mut cache = self.discovered.lock().await;
+        for record in discovered {
+            if record.provider_peer_id == self_id || record.content_key != content_key {
+                continue;
+            }
+            let mut entry = record.clone();
+            entry.expires_at = entry.expires_at.min(ceiling);
+            if entry.is_expired(now) {
+                continue;
+            }
+            cache.put_at(entry, now);
+        }
+    }
+
     /// Build a provider record for content key `target` naming THIS node, expiring at
     /// `now + provider_ttl`.
     fn build_local_record(&self, target: &Key) -> ProviderRecord {
@@ -691,7 +818,24 @@ impl DhtService {
     }
 }
 
-/// Current wall-clock Unix seconds (saturating to 0 before the epoch), for provider TTLs.
+/// Merge two provider sets into one answer: `authoritative` first, then `extra`, deduped by
+/// provider `peer_id` and with anything expired at `now` dropped.
+///
+/// Order is the contract, not an accident. The caller dials the list front-to-back, so the records
+/// whose provenance this node established lead, and the weaker-provenance set (a discovery-cache
+/// hit, or the records a lookup just collected) follows. A provider present in both keeps its
+/// authoritative entry, because the first occurrence wins.
+fn merge_dedup_by_provider(
+    mut authoritative: Vec<ProviderRecord>,
+    extra: Vec<ProviderRecord>,
+    now: u64,
+) -> Vec<ProviderRecord> {
+    authoritative.extend(extra);
+    let mut seen = std::collections::HashSet::new();
+    authoritative.retain(|r| !r.is_expired(now) && seen.insert(r.provider_peer_id.clone()));
+    authoritative
+}
+
 /// Parse a 64-hex string into a [`Key`] (used on the serving side for wire targets).
 fn parse_key(hex: &str) -> Option<Key> {
     hex64_to_bytes(hex).map(Key::from_bytes)
