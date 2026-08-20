@@ -307,6 +307,21 @@ impl ProviderStore {
         removed
     }
 
+    /// Drop EVERY record for `content_key`, returning how many were removed.
+    ///
+    /// Unlike [`remove`](Self::remove) — the authenticated per-holder retract — this is a
+    /// whole-key wipe, so it MUST NOT be reachable from any wire path: a peer able to drive it
+    /// against the authoritative store would hold a censorship primitive over any key it names.
+    /// Its one caller is the node's own decision to forget a DISCOVERY-CACHE entry whose holders
+    /// all turned out to be undialable (`DhtService::forget_discovered`), where the records being
+    /// dropped are this node's own unverified hearsay and nobody else can see them.
+    pub fn remove_key(&mut self, content_key: &str) -> usize {
+        self.by_key
+            .remove(content_key)
+            .map(|providers| providers.len())
+            .unwrap_or(0)
+    }
+
     /// The live (non-expired at `now`) provider records for `content_key`. Expired records are
     /// skipped (and cleaned up by [`gc`](Self::gc)); returns an empty vec if none are known/live.
     pub fn get(&self, content_key: &str, now: u64) -> Vec<ProviderRecord> {

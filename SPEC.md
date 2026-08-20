@@ -453,6 +453,80 @@ This is an equality check on the full 64-hex `content_key`, not a prefix or dist
 near-miss key is not the queried key. Records the finder holds LOCALLY are indexed by key and are
 therefore already bound to it.
 
+### 6.8 Discovery cache (lookup-result caching)
+
+A node MUST keep the provider records its OWN lookups collect, so a later fetch of the same content
+dials directly instead of walking the DHT again. A `.dig` download issues many requests against one
+store; without this, each one pays a full iterative lookup for an answer the node already had.
+
+**Two stores, one type, different provenance.** The discovery cache is a SEPARATE `ProviderStore`
+instance from the authoritative store of §6.3, and the separation is normative rather than an
+implementation detail:
+
+| | Authoritative store (§6.3) | Discovery cache (§6.8) |
+|---|---|---|
+| Written by | own announce; mTLS-checked `add_provider` (§6.4); caller-verified ingest (§6.5) | this node's own `find_providers` walks |
+| Attribution | established — the record's subject was authenticated | **none** — an arbitrary peer on the walk asserted a third party holds the content |
+| Read by inbound `find_providers` (§10.1) | **yes** | **MUST NOT** |
+| Reported by `provider_snapshot` | yes | **MUST NOT** |
+| Republished (§9.3) | yes | **MUST NOT** |
+| TTL | `provider_ttl` | `discovery_cache_ttl`, clamped down |
+
+A cached record is hearsay. Hearsay MUST stay on the FETCH path, where a wrong candidate costs one
+wasted dial because content is accepted only when it verifies against its merkle root. It MUST NOT
+reach the ASSERTION path, where it would become THIS node's claim about who holds what: re-serving
+it would launder one fabricated record, fed to one node, into an answer the rest of the network
+reads back — at a keyspace position this node has no `k`-closest duty over.
+
+**Admission (all three MUST hold, in order):**
+
+1. A record naming THIS node MUST NOT be cached. It is useless as a dial target, and caching it
+   would make the cache non-empty and so suppress the next real lookup — letting a peer that echoes
+   our own record back at us pin us to a provider set we cannot use.
+2. A record whose `content_key` is not the queried key MUST NOT be cached. §6.7 already discards
+   these at the wire boundary; the cache re-checks because this write outlives the lookup.
+3. The record's expiry MUST be clamped DOWN to `min(record.expires_at, now + discovery_cache_ttl)`,
+   never up, and a record already expired at `now` MUST NOT be cached. A peer therefore cannot
+   lengthen its own residence in another node's cache by claiming a distant expiry.
+
+Every surviving record is admitted through the same `ProviderStore` admission control as §6.3, so
+the cache's per-key and global caps bound it identically; this write path has no way to exceed them.
+
+**TTL.** `discovery_cache_ttl` defaults to **15 minutes**, far shorter than `provider_ttl`, because
+**nothing republishes into this cache**. An authoritative record survives 2 hours because its holder
+refreshes it every `republish_interval`; a cached one has no keeper, so its age is a guess about a
+holder this node has not spoken to since. 15 minutes spans a whole multi-range download and the
+re-reads that follow it — where the saving accrues — while keeping a holder that dropped the content
+from being dialed for the rest of the afternoon.
+
+**Reads and invalidation.**
+
+- `find_providers(content)` — when the cache holds a live record for the key, it answers from the
+  cache and MUST make no network round-trip. Records held AUTHORITATIVELY MUST NOT short-circuit the
+  walk this way: they may be this node's own announce, and stopping on them would keep a publisher
+  from ever learning the other holders of its own content.
+- `cached_providers(content)` — the cached records, live as of now, with no fallback walk.
+- `forget_discovered(content) -> usize` — drop every cached record for the key so the next
+  `find_providers` runs a real lookup. A caller that has tried every cached candidate and reached
+  none of them MUST call this and ask again rather than concluding the content has no providers.
+  This bounds the one exposure the cache adds: a lookup already early-exits on the first on-key
+  answer (§8), so a lying first hop could always return a fabricated provider set — the cache makes
+  that answer sticky for `discovery_cache_ttl`, and `forget_discovered` is the escape from it. It
+  touches only this node's own cache, so it can neither censor a key this node serves nor be
+  observed by any other peer.
+- `gc()` sweeps BOTH stores at one `now`, so a maintenance tick cannot leave them disagreeing about
+  the instant it ran at.
+
+**NEGATIVE CACHING IS FORBIDDEN.** A node MUST NOT record "this key has no providers". A peer that
+could get itself recorded as an authoritative absence would hold a denial-of-service primitive over
+any key it names, obtained by answering one lookup with silence.
+
+**Privacy.** The cache is a durable record of what THIS node went looking for, so it is
+per-node-local process state: never served (§10.1), never in `provider_snapshot`, never republished,
+and never persisted to disk by this crate. Its residence time is bounded by `discovery_cache_ttl`,
+which is therefore also the window in which a host-level compromise can read the node's recent
+interest set.
+
 ## 7. Routing table
 
 ### 7.1 Structure
@@ -669,6 +743,9 @@ A conforming production implementation (wired by the embedding node, e.g. `dig-n
 | `rpc_timeout` | Per-RPC deadline (enforced by the transport, §11) | **5 seconds** |
 | `provider_store_limits.max_providers_per_key` | Per-content-key provider-record cap, soonest-to-expire evicted on overflow (§6.3) | **20** |
 | `provider_store_limits.max_total_records` | Global provider-record ceiling across all keys, new records rejected on overflow (§6.3) | **100 000** |
+| `discovery_cache_ttl` | Residence time of a record learned from this node’s own lookup, clamped down never up (§6.8) | **15 minutes** |
+| `discovery_cache_limits.max_providers_per_key` | Per-key cap on the discovery cache (§6.8) | **8** |
+| `discovery_cache_limits.max_total_records` | Global ceiling on the discovery cache (§6.8) | **10 000** |
 
 Defaults for `k` and `α` follow the canonical Kademlia paper (Maymounkov & Mazières, 2002).
 
@@ -712,6 +789,14 @@ Invariant: **no single peer failure is ever fatal to a lookup.**
   dead, resisting table-flush attacks by newly minted ids.
 - **Soft state.** Provider records self-expire (§6.2); a withdrawn or dead provider disappears
   within one `provider_ttl` without any delete protocol.
+- **Hearsay is never re-asserted.** Records collected by this node's own lookups live in the
+  discovery cache (§6.8), a store separate from the authoritative one. Nothing authenticated them,
+  so they are read only on the FETCH path — where a wrong candidate costs one wasted dial and the
+  merkle bind rejects the bytes — and never on the ASSERTION path: an inbound `find_providers`, a
+  `provider_snapshot`, or a republish MUST NOT see them. Merging the two stores would let one
+  fabricated record fed to one node be laundered into an answer the rest of the network reads back.
+  The cache is additionally bounded by its own caps, clamps every expiry DOWN, refuses records
+  naming this node, and stores no negative results (which would be a per-key DoS primitive).
 - **Bounded provider store.** `add_provider` is admission-controlled (§6.3): a per-key cap and a
   global cap (rejection) bound the memory a single peer's `add_provider` traffic can consume,
   independent of any rate limiting the embedding node may add.
@@ -771,7 +856,9 @@ Exported from the crate root (`#![forbid(unsafe_code)]`, MSRV **1.75.0**, licens
   `refresh_buckets()`, `gc()`, `ping(&Contact)`, `handle_request(DhtRequest)`,
   `handle_request_from(Option<Contact>, DhtRequest)`, `known_closest(&Key)`, `routing_len()`,
   `ingest_verified_provider(ProviderRecord)`, `remove_provider_record(String, PeerId)`,
-  `retract_own_provider(&ContentId)`, `holders_of(&ContentId)`.
+  `retract_own_provider(&ContentId)`, `holders_of(&ContentId)`,
+  `cached_providers(&ContentId)` / `forget_discovered(&ContentId)` (§6.8),
+  `provider_snapshot(usize)`.
 - `DhtConfig` (§12), `ContentId` (§3–4), `Key` / `Distance` (§2), `ProviderRecord` /
   `CandidateAddr` / `AddressKind` / `MAX_ADDRESSES_PER_RECORD` / `dial_candidates` /
   `MAX_DIAL_CANDIDATES` (§5.5, §6) — `ProviderRecord::dial_candidates()` and
@@ -781,7 +868,9 @@ Exported from the crate root (`#![forbid(unsafe_code)]`, MSRV **1.75.0**, licens
   `MAX_FRAMED_BODY` (§5), `DhtError` (§13), and the re-exported `dig_nat::PeerId` (one
   peer-identity type across the transport and the DHT).
 - `lookup::iterative_find` (§8) and `provider_store::ProviderStore` /
-  `provider_store::ProviderStoreLimits` / `provider_store::PutOutcome` (§6.3) are public modules
+  `provider_store::ProviderStoreLimits` / `provider_store::PutOutcome` /
+  `provider_store::ProviderStore::remove_key` (a whole-key wipe reachable from NO wire path, whose
+  only caller is `forget_discovered` over this node's own cache, §6.8) are public modules
   usable directly. `ProviderStore::put_at(record, now)` is the admission entry point that takes the
   caller's clock — `put(record)` delegates to it with the system clock — so admission, expiry, and
   eviction can all be evaluated against ONE instant (§6.3 step 1 requires a liveness test, which
