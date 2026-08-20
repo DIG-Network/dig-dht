@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.12.0] - 2026-08-20
+
+### Features
+- **service:** Cache lookup-learned providers so a later dial skips rediscovery (#20)
+
 ## [0.11.1] - 2026-08-02
 
 ### Features
