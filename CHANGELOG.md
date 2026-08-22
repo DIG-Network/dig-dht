@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.12.1] - 2026-08-22
+
+### Build
+- **deps:** Bump dig-nat 0.18 → 0.20 (cascade 3 of chia-0.36) (#21)
+
 ## [0.12.0] - 2026-08-20
 
 ### Features
