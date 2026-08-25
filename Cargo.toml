@@ -16,7 +16,7 @@
 # in-memory transport harness (NO real network).
 [package]
 name = "dig-dht"
-version = "0.12.1"
+version = "0.13.0"
 edition = "2021"
 rust-version = "1.75.0"
 license = "Apache-2.0 OR MIT"
@@ -58,7 +58,16 @@ categories = ["network-programming"]
 # no longer accepts a `String`. A consumer matching on `DhtError::Transport(s)` and using `s` as a
 # `String` must change. That is the intended cost: it is what makes raw peer text unrepresentable
 # rather than merely discouraged.
-dig-nat = "0.20"
+#
+# `0.20` -> `0.21` (relay cascade, dig_ecosystem#3159): dig-nat 0.21 is the fix for a stale relayed
+# circuit suppressing a fresh dial — a live-circuit requirement with a 30s idle window. It carries NO
+# public API change (its 0.20..0.21 diff touches only `src/relay.rs` internals, `SPEC.md` and the
+# manifest), so nothing in this crate migrates. The bump is mandatory rather than cosmetic for the
+# usual `0.x`-MINOR reason: a consumer that reaches dig-nat both directly and through this crate would
+# otherwise resolve TWO dig-nat copies, and `PeerId` / `SafeText` cross this crate's public API from
+# dig-nat. It also carries `dig-constants ^0.11.1` and `dig-identity ^0.7` forward; this crate declares
+# neither, so both arrive purely transitively.
+dig-nat = "0.21"
 
 # Address-family (IPv6-first / IPv4-fallback) contract — the ecosystem's single source of truth for
 # `Family::of` classification (CLAUDE.md §5.2, epic #1020). The DHT derives the FAMILY half of its
