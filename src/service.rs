@@ -34,7 +34,7 @@ use crate::error::DhtError;
 use crate::key::Key;
 use crate::lookup::{iterative_find, QueryOutcome};
 use crate::provider_store::{ProviderSnapshot, ProviderStore, PutOutcome};
-use crate::record::{CandidateAddr, ProviderRecord};
+use crate::record::{hex64_to_bytes, CandidateAddr, ProviderRecord};
 use crate::routing::{Contact, InsertOutcome, RoutingTable};
 use crate::transport::DhtTransport;
 use crate::wire::{DhtRequest, DhtResponse};
@@ -284,14 +284,42 @@ impl DhtService {
     ///
     /// Called when the node's inventory gains content (a new capsule/root/resource it now serves).
     pub async fn announce_provider(&self, content: &ContentId) -> Result<usize, DhtError> {
-        let target = content.to_key();
-        let record = self.build_local_record(&target);
+        self.announce_provider_with_collateral(content, None).await
+    }
 
-        // Store locally + remember for republish.
+    /// As [`announce_provider`](Self::announce_provider), but also publishing this node's claimed
+    /// mirror-coin id so a verifier can fetch ONE coin instead of scanning by hint.
+    ///
+    /// The pointer is per-content because a mirror coin bonds a `(store, root, owner, epoch)`
+    /// tuple, and it is remembered so every [`republish`](Self::republish) re-attaches it. Pass
+    /// `None` — or call [`announce_provider`](Self::announce_provider) — when there is no coin yet;
+    /// **absence is a normal, fully-supported state**, not a degraded one, since the verifier's
+    /// fallback is the hint scan.
+    ///
+    /// To refresh the pointer across an epoch rollover, announce again with the new coin id.
+    ///
+    /// Publishing a pointer claims nothing that a consumer will believe: see
+    /// [`ProviderRecord::unverified_mirror_coin_id`].
+    pub async fn announce_provider_with_collateral(
+        &self,
+        content: &ContentId,
+        unverified_mirror_coin_id: Option<[u8; 32]>,
+    ) -> Result<usize, DhtError> {
+        let target = content.to_key();
+        let mut record = self.build_local_record(&target);
+        if let Some(coin_id) = unverified_mirror_coin_id {
+            record = record.with_unverified_mirror_coin_id(coin_id);
+        }
+
+        // Store locally + remember for republish (pointer included, so the first TTL rollover does
+        // not silently drop it).
         {
             let mut ps = self.providers.lock().await;
             ps.put(record.clone());
-            ps.mark_announced(target.to_hex());
+            ps.mark_announced_with_collateral(
+                target.to_hex(),
+                record.unverified_mirror_coin_id.clone(),
+            );
         }
 
         // PUT at the k closest peers we can find.
@@ -424,7 +452,16 @@ impl DhtService {
                 continue;
             };
             let target = Key::from_bytes(bytes);
-            let record = self.build_local_record(&target);
+            let mut record = self.build_local_record(&target);
+            // Re-attach the pointer this key was announced with. Rebuilding from
+            // `build_local_record` alone would drop it on the first republish, so a node would
+            // appear to have lost its collateral pointer one TTL after announcing it.
+            record.unverified_mirror_coin_id = self
+                .providers
+                .lock()
+                .await
+                .announced_collateral(&hex)
+                .map(str::to_owned);
             self.providers.lock().await.put(record.clone());
             let seeds = self.seed_contacts(&target).await;
             if !seeds.is_empty() {
@@ -841,21 +878,6 @@ fn parse_key(hex: &str) -> Option<Key> {
     hex64_to_bytes(hex).map(Key::from_bytes)
 }
 
-/// Decode a 64-char hex string to 32 bytes.
-fn hex64_to_bytes(hex: &str) -> Option<[u8; 32]> {
-    if hex.len() != 64 {
-        return None;
-    }
-    let mut out = [0u8; 32];
-    let bytes = hex.as_bytes();
-    for (i, chunk) in bytes.chunks(2).enumerate() {
-        let hi = (chunk[0] as char).to_digit(16)?;
-        let lo = (chunk[1] as char).to_digit(16)?;
-        out[i] = ((hi << 4) | lo) as u8;
-    }
-    Some(out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -878,6 +900,151 @@ mod tests {
     fn parse_key_rejects_bad_hex() {
         assert!(parse_key("nothex").is_none());
         assert!(parse_key(&"00".repeat(32)).is_some());
+    }
+}
+
+#[cfg(test)]
+mod collateral_pointer_tests {
+    use super::*;
+    use crate::record::CandidateAddr;
+
+    const BONDED_COIN: [u8; 32] = [0x5c; 32];
+
+    /// A transport that is never dialled: these tests exercise the LOCAL provider store only, so an
+    /// unseeded routing table makes every lookup a no-op.
+    struct UnusedTransport;
+
+    #[async_trait::async_trait]
+    impl crate::transport::DhtTransport for UnusedTransport {
+        async fn rpc(
+            &self,
+            _from: &Contact,
+            _peer: &Contact,
+            _request: &DhtRequest,
+        ) -> Result<DhtResponse, DhtError> {
+            unreachable!("collateral-pointer tests never dial a peer")
+        }
+    }
+
+    fn service() -> DhtService {
+        DhtService::new(
+            PeerId::from_bytes([9u8; 32]),
+            vec![CandidateAddr::direct("h", 9444)],
+            DhtConfig::default(),
+            Arc::new(UnusedTransport),
+        )
+    }
+
+    /// The local record this node published for `content`.
+    async fn local_record(svc: &DhtService, content: &ContentId) -> ProviderRecord {
+        svc.providers
+            .lock()
+            .await
+            .get(&content.to_key().to_hex(), now_secs())
+            .into_iter()
+            .find(|r| r.provider_peer_id == svc.local_id.to_hex())
+            .expect("this node should have a local record for the announced content")
+    }
+
+    #[tokio::test]
+    async fn announcing_with_collateral_publishes_the_pointer_and_without_omits_it() {
+        let svc = service();
+        let bonded = ContentId::store([1u8; 32]);
+        let bare = ContentId::store([2u8; 32]);
+
+        svc.announce_provider_with_collateral(&bonded, Some(BONDED_COIN))
+            .await
+            .unwrap();
+        svc.announce_provider(&bare).await.unwrap();
+
+        assert_eq!(
+            local_record(&svc, &bonded)
+                .await
+                .unverified_mirror_coin_id_bytes(),
+            Some(BONDED_COIN)
+        );
+        assert_eq!(
+            local_record(&svc, &bare).await.unverified_mirror_coin_id,
+            None,
+            "a bare announce must not acquire a pointer from a sibling announce"
+        );
+    }
+
+    /// The PLACEMENT test. Republish rebuilds the record from scratch, so a pointer held anywhere
+    /// but per-announced-key is lost on the first TTL rollover — a node would look collateralised
+    /// for one TTL and bare afterwards.
+    ///
+    /// Two keys, exactly one pointered: a service-wide or config-held pointer would re-attach it to
+    /// BOTH and pass a single-key version of this test. That is the nearest wrong implementation,
+    /// so the bare key is the control that makes relocation observable.
+    #[tokio::test]
+    async fn republish_re_attaches_each_keys_own_pointer_and_only_its_own() {
+        let svc = service();
+        let bonded = ContentId::store([1u8; 32]);
+        let bare = ContentId::store([2u8; 32]);
+
+        svc.announce_provider_with_collateral(&bonded, Some(BONDED_COIN))
+            .await
+            .unwrap();
+        svc.announce_provider(&bare).await.unwrap();
+
+        assert_eq!(svc.republish().await, 2);
+
+        assert_eq!(
+            local_record(&svc, &bonded)
+                .await
+                .unverified_mirror_coin_id_bytes(),
+            Some(BONDED_COIN),
+            "republish dropped the pointer this key was announced with"
+        );
+        assert_eq!(
+            local_record(&svc, &bare).await.unverified_mirror_coin_id,
+            None,
+            "republish invented a pointer for a key that never had one"
+        );
+    }
+
+    /// Re-announcing after an epoch rollover replaces the pointer rather than accumulating one.
+    #[tokio::test]
+    async fn re_announcing_replaces_the_pointer() {
+        let svc = service();
+        let content = ContentId::store([1u8; 32]);
+        let next_epoch_coin = [0xE7; 32];
+
+        svc.announce_provider_with_collateral(&content, Some(BONDED_COIN))
+            .await
+            .unwrap();
+        svc.announce_provider_with_collateral(&content, Some(next_epoch_coin))
+            .await
+            .unwrap();
+        svc.republish().await;
+
+        assert_eq!(
+            local_record(&svc, &content)
+                .await
+                .unverified_mirror_coin_id_bytes(),
+            Some(next_epoch_coin)
+        );
+    }
+
+    /// Withdrawing forgets the pointer with the announcement, so a later bare re-announce cannot
+    /// resurrect a stale coin id.
+    #[tokio::test]
+    async fn withdrawing_forgets_the_pointer() {
+        let svc = service();
+        let content = ContentId::store([1u8; 32]);
+
+        svc.announce_provider_with_collateral(&content, Some(BONDED_COIN))
+            .await
+            .unwrap();
+        svc.withdraw_provider(&content).await;
+        svc.announce_provider(&content).await.unwrap();
+        svc.republish().await;
+
+        assert_eq!(
+            local_record(&svc, &content).await.unverified_mirror_coin_id,
+            None
+        );
     }
 }
 

@@ -42,6 +42,8 @@ Textbook Kademlia (Maymounkov & Mazières), specialized to DIG content discovery
 - **Iterative lookups** with α-parallelism, converging on the `k` closest peers to a target — one
   engine serves both `find_node` and `find_providers`.
 - **Provider records** are the point: `(content_key, provider_peer_id, addresses, expires_at)`.
+  A record MAY also carry an OPTIONAL `unverified_mirror_coin_id` — a POINTER to the collateral
+  coin, never evidence of it. The DHT discovers; the chain verifies. See SPEC.md 6.6.
   Announced at the `k` nodes closest to the content key, **TTL'd**, and **republished** before
   expiry so offline providers age out automatically.
 
@@ -70,7 +72,7 @@ for its control messages). `type`-tagged JSON, aligned to the L7 peer-network st
 | `ping` | `{ "type":"ping", "nonce":<uint> }` | `{ "type":"pong", "nonce":<uint> }` |
 
 where `Contact = { "peer_id":"<64hex>", "addresses":[{ "host":str, "port":uint, "kind":"direct"|"mapped"|"reflexive"|"relay" }] }`
-and `ProviderRecord = { "content_key":"<64hex>", "provider_peer_id":"<64hex>", "addresses":[…], "expires_at":<unix-secs> }`
+and `ProviderRecord = { "content_key":"<64hex>", "provider_peer_id":"<64hex>", "addresses":[…], "expires_at":<unix-secs>, "unverified_mirror_coin_id"?:"<64hex>" }`
 — the address shape is byte-compatible with the L7 `dig.getPeers` peers. A responder that cannot
 answer returns `{ "type":"error", "code":uint, "message":str }` (advisory — a lookup treats it like
 an unreachable peer).

@@ -187,6 +187,7 @@ mod tests {
                 provider_peer_id: "ef".repeat(32),
                 addresses: vec![CandidateAddr::direct("203.0.113.7", 9444)],
                 expires_at: 1_719_763_200,
+                unverified_mirror_coin_id: None,
             }],
             closer: vec![Contact {
                 peer_id: "12".repeat(32),

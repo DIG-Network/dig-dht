@@ -563,6 +563,7 @@ async fn add_provider_with_unbounded_addresses_is_capped_at_the_boundary() {
         provider_peer_id: pid(0x24, 0).to_hex(),
         addresses: flood,
         expires_at: u64::MAX,
+        unverified_mirror_coin_id: None,
     };
     let resp = victim
         .handle_request(DhtRequest::AddProvider { record: malicious })
@@ -736,6 +737,7 @@ async fn ingest_verified_provider_bypasses_self_announce_but_still_clamps_and_ca
         provider_peer_id: holder.to_hex(),
         addresses: flood,
         expires_at: u64::MAX, // "never expires"
+        unverified_mirror_coin_id: None,
     };
 
     let outcome = node.ingest_verified_provider(record).await;
@@ -791,6 +793,7 @@ async fn ingest_verified_provider_still_rejects_over_global_capacity() {
         provider_peer_id: pid(0x43, tag).to_hex(),
         addresses: addr(),
         expires_at: u64::MAX,
+        unverified_mirror_coin_id: None,
     };
     assert_eq!(
         node.ingest_verified_provider(mk(1)).await,
@@ -968,6 +971,7 @@ impl DhtTransport for StampingTransport {
                     provider_peer_id: answer.provider.to_hex(),
                     addresses: addr(),
                     expires_at: u64::MAX,
+                    unverified_mirror_coin_id: None,
                 }],
                 closer: answer.closer.clone(),
             }),
