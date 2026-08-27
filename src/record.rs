@@ -204,6 +204,31 @@ pub(crate) fn to_hex64(bytes: &[u8; 32]) -> String {
     out
 }
 
+/// Normalize an [`unverified_mirror_coin_id`](ProviderRecord::unverified_mirror_coin_id) to its
+/// canonical form: a lowercase 64-hex string, or `None` for anything else.
+///
+/// **Normalize, never reject.** This field is attacker-supplied and OPTIONAL, so a malformed value
+/// must cost the record nothing: erroring would let any peer destroy a whole provider record - and
+/// with it the discovery the DHT exists for - by appending one junk field. Dropping it instead
+/// leaves the record exactly as useful as one that never carried a pointer, which is the defined
+/// fallback.
+///
+/// It also BOUNDS the field, which is why it runs at EVERY ingress rather than only at the wire.
+/// The value is otherwise unbounded: the struct's fields are `pub`, so a record built by literal -
+/// how a consumer folds a verified holdings-announce in - can carry a 256 KiB pointer (the frame
+/// ceiling, [`MAX_FRAMED_BODY`](crate::wire::MAX_FRAMED_BODY)). Stored verbatim it is re-served in
+/// every `Providers` response for that key, which no outbound cap trims, so every querier's framing
+/// check rejects the answer and the key goes undiscoverable through this node for a full TTL. That
+/// is the same amplification the address cap closes, and the same discovery denial this
+/// normalize-never-reject rule exists to prevent.
+///
+/// Lowercasing is not cosmetic: without it the same coin published in two cases yields two
+/// non-equal records, so dedup and equality would split on presentation.
+pub(crate) fn normalize_mirror_coin_id(raw: Option<&str>) -> Option<String> {
+    raw.map(str::to_ascii_lowercase)
+        .filter(|s| hex64_to_bytes(s).is_some())
+}
+
 /// Wire-boundary normalization for
 /// [`unverified_mirror_coin_id`](ProviderRecord::unverified_mirror_coin_id): anything that is not a
 /// 64-hex string becomes `None`, and a valid one is lowercased.
@@ -223,11 +248,9 @@ where
     D: serde::Deserializer<'de>,
 {
     let raw = Option::<serde_json::Value>::deserialize(deserializer)?;
-    Ok(raw
-        .as_ref()
-        .and_then(|v| v.as_str())
-        .map(str::to_ascii_lowercase)
-        .filter(|s| hex64_to_bytes(s).is_some()))
+    Ok(normalize_mirror_coin_id(
+        raw.as_ref().and_then(|v| v.as_str()),
+    ))
 }
 
 /// Upper bound on how many candidates [`dial_candidates`] hands a dialer for ONE peer, so a record

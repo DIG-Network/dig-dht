@@ -313,11 +313,18 @@ those claims is actually bonded. This field makes step two a direct lookup inste
   single chain read with no retry loop, falling straight back to the hint scan on a miss or a failed
   bond check. A mismatch MUST NOT be grounds for blocklisting — it is indistinguishable from an
   epoch rollover.
-- **Wire normalization (wire contract).** A responder MUST NOT trust the field as received. A value
+- **Normalization at EVERY ingress (wire contract).** A responder MUST NOT trust the field as
+  received, and MUST normalize it in the admission pipeline (§6.3) and not only when decoding a
+  frame: a record can also enter through an authenticated push (§6.4) as an already-constructed
+  value that no decoder ever saw. A value
   that is not a 64-hex string — wrong length, non-hex, a non-string JSON type, or a body-sized
   string — MUST be normalized to ABSENT rather than rejected: erroring would let any peer destroy a
   whole provider record, and with it the discovery the DHT exists for, by appending one junk field.
   A valid value MUST be stored lowercased, so two records naming one coin compare equal.
+  Normalizing at only one ingress is a defect: an unbounded pointer that reaches storage is
+  re-served in every `Providers` answer for that key, no outbound cap trims it, and the answer then
+  exceeds the framing ceiling (§5) for every querier — making the key undiscoverable through that
+  node for a full TTL, which is the exact denial this rule exists to prevent.
 - **No verification in this crate.** The DHT has no chain source. It carries the pointer and states
   that it is untrusted; verification belongs to the consumer.
 

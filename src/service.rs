@@ -361,8 +361,11 @@ impl DhtService {
     /// poisons the local provider set.
     ///
     /// Every other admission guard still applies exactly as for `add_provider`: the address list is
-    /// capped ([`MAX_ADDRESSES_PER_RECORD`](crate::MAX_ADDRESSES_PER_RECORD)), `expires_at` is
-    /// clamped to `min(record.expires_at, now + provider_ttl)` (§6.2), and the per-key / global
+    /// capped ([`MAX_ADDRESSES_PER_RECORD`](crate::MAX_ADDRESSES_PER_RECORD)),
+    /// `unverified_mirror_coin_id` is normalized to canonical lowercase 64-hex or dropped to `None`
+    /// (so a caller need not bound it, and MUST NOT rely on it having survived verbatim),
+    /// `expires_at` is clamped to `min(record.expires_at, now + provider_ttl)` (§6.2), and the
+    /// per-key / global
     /// admission caps (§6.3) are enforced — an over-capacity ingest returns
     /// [`PutOutcome::RejectedOverCapacity`] and stores nothing. On acceptance the holder is folded
     /// into the routing table so this node can reach it.
@@ -627,16 +630,24 @@ impl DhtService {
     /// 1. **Cap the address list** at [`MAX_ADDRESSES_PER_RECORD`](crate::MAX_ADDRESSES_PER_RECORD)
     ///    — a record decoded off the wire bypasses `ProviderRecord::new`'s cap (its fields are
     ///    public), so an attacker could otherwise pack thousands of addresses into one record.
-    /// 2. **Clamp `expires_at`** to `now + provider_ttl` — an inbound record is never trusted to
+    /// 2. **Normalize `unverified_mirror_coin_id`** to a canonical lowercase 64-hex string or
+    ///    `None`. Same reason as the address cap and the same blind spot: the wire boundary's
+    ///    `deserialize_mirror_coin_id` only runs under serde, so a record built by literal (how a
+    ///    consumer folds a verified holdings-announce in) could otherwise carry a body-sized
+    ///    pointer that this node stores AND re-serves until every querier's frame check rejects the
+    ///    answer, making the key undiscoverable through us for a full TTL.
+    /// 3. **Clamp `expires_at`** to `now + provider_ttl` — an inbound record is never trusted to
     ///    self-report its expiry; without this a record naming `u64::MAX` would never GC.
-    /// 3. **Admission-control** via [`ProviderStore::put`], enforcing the per-key + global caps so a
+    /// 4. **Admission-control** via [`ProviderStore::put`], enforcing the per-key + global caps so a
     ///    flood cannot grow the store without bound.
-    /// 4. On [`PutOutcome::Accepted`], **fold the holder into the routing table** (its addresses let
+    /// 5. On [`PutOutcome::Accepted`], **fold the holder into the routing table** (its addresses let
     ///    us reach it). A rejected record folds nothing.
     ///
     /// [`ingest_verified_provider`]: Self::ingest_verified_provider
     async fn admit_verified_record(&self, mut record: ProviderRecord) -> PutOutcome {
         crate::record::sort_and_cap_addresses(&mut record.addresses);
+        record.unverified_mirror_coin_id =
+            crate::record::normalize_mirror_coin_id(record.unverified_mirror_coin_id.as_deref());
 
         let now = now_secs();
         let clamp_ceiling = now.saturating_add(self.config.provider_ttl_secs());
@@ -1025,6 +1036,81 @@ mod collateral_pointer_tests {
                 .unverified_mirror_coin_id_bytes(),
             Some(next_epoch_coin)
         );
+    }
+
+    /// The NON-SERDE ingress. `ingest_verified_provider` takes an already-constructed
+    /// [`ProviderRecord`], whose fields are all `pub`, so `deserialize_mirror_coin_id` never runs on
+    /// it - which is exactly how a consumer folding a verified holdings-announce into the DHT builds
+    /// one. A test that goes through serde passes without the fix and proves nothing, so this one
+    /// builds the record by struct literal.
+    ///
+    /// Three pointers, because "clears the field" and "normalizes the field" are different
+    /// implementations and only a truthful control tells them apart: one oversized (sized FROM the
+    /// protocol's own [`MAX_FRAMED_BODY`] ceiling, which is the value that makes the record
+    /// unservable), one 64 chars but not hex (a length-only check would admit it), and one VALID,
+    /// which must survive.
+    #[tokio::test]
+    async fn ingesting_a_record_built_by_literal_normalizes_its_pointer() {
+        use crate::wire::MAX_FRAMED_BODY;
+
+        let svc = service();
+        let valid = crate::record::to_hex64(&BONDED_COIN);
+
+        let cases: [(&str, String, Option<String>); 3] = [
+            (
+                "an oversized pointer must not be stored",
+                "a".repeat(MAX_FRAMED_BODY),
+                None,
+            ),
+            (
+                "a 64-char non-hex pointer must not be stored",
+                "z".repeat(64),
+                None,
+            ),
+            (
+                "a canonical pointer must survive ingest",
+                valid.clone(),
+                Some(valid.clone()),
+            ),
+        ];
+
+        for (i, (why, pointer, expected)) in cases.into_iter().enumerate() {
+            let content = ContentId::store([i as u8 + 40; 32]);
+            let content_key = content.to_key().to_hex();
+            let holder = PeerId::from_bytes([i as u8 + 70; 32]);
+
+            let outcome = svc
+                .ingest_verified_provider(ProviderRecord {
+                    content_key: content_key.clone(),
+                    provider_peer_id: holder.to_hex(),
+                    addresses: vec![CandidateAddr::direct("holder.example", 9444)],
+                    expires_at: now_secs() + 60,
+                    unverified_mirror_coin_id: Some(pointer),
+                })
+                .await;
+            assert_eq!(outcome, PutOutcome::Accepted, "{why}: ingest must accept");
+
+            let providers = svc.providers.lock().await.get(&content_key, now_secs());
+            let stored = providers
+                .iter()
+                .find(|r| r.provider_peer_id == holder.to_hex())
+                .expect("the ingested record should be stored");
+            assert_eq!(stored.unverified_mirror_coin_id, expected, "{why}");
+
+            // The harm the bound exists to prevent: an oversized pointer is re-served in every
+            // answer for this key, and no OUTBOUND cap trims it - so the frame the querier must
+            // decode is what actually has to stay under the ceiling.
+            let frame = crate::wire::DhtResponse::Providers {
+                providers: providers.clone(),
+                closer: vec![],
+            }
+            .encode();
+            assert!(
+                frame.len() <= MAX_FRAMED_BODY,
+                "{why}: the answer for this key is unservable at {} bytes",
+                frame.len()
+            );
+        }
     }
 
     /// Withdrawing forgets the pointer with the announcement, so a later bare re-announce cannot
