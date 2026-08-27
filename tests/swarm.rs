@@ -1425,6 +1425,63 @@ async fn a_record_naming_this_node_is_never_cached() {
     );
 }
 
+/// The pointer `find_providers` hands its CALLER is normalized — not merely the copy it caches.
+///
+/// `a_cached_record_pointer_is_normalized` below cannot speak for this. It reads back through
+/// `cached_providers`, and with both layers present that read is satisfied by EITHER of them alone:
+/// the lookup pass and the cache write mutually mask each other, so deleting either one on its own
+/// stays green. The guarantee that actually matters to a consumer — that application code never
+/// receives a raw peer-supplied pointer — therefore had no test at all.
+///
+/// This one never touches the cache. It asserts on the `Vec<ProviderRecord>` returned by
+/// `find_providers`, which is built from the lookup's own records rather than read back out of the
+/// cache, so it stands on the lookup-side normalization and nothing else.
+///
+/// Three cases, because "rejects", "clears" and "normalizes" are three different implementations:
+/// an unrepresentable pointer must be dropped; an UPPERCASE canonical one must come back
+/// lowercased, which a drop-only fix fails; and a canonical one must survive verbatim, which a
+/// clear-everything fix fails.
+#[tokio::test]
+async fn the_pointer_returned_to_the_caller_is_normalized() {
+    const VALID: &str = "e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7";
+
+    // Sized FROM the protocol's own ceiling, as the sibling cache test is.
+    let oversized = "a".repeat(dig_dht::wire::MAX_FRAMED_BODY);
+
+    for (seed, sent, expected) in [
+        (0xC1u8, oversized, None),
+        (0xC2, VALID.to_uppercase(), Some(VALID.to_string())),
+        (0xC3, VALID.to_string(), Some(VALID.to_string())),
+    ] {
+        let wanted = ContentId::store([seed; 32]);
+        let responder = pid(0xEE, 0x01);
+        let seeker = scripted_seeker(
+            &[responder],
+            HashMap::from([(
+                responder.to_hex(),
+                CannedAnswer {
+                    stamped_key: StampedKey::Queried,
+                    provider: responder,
+                    closer: vec![],
+                    pointer: Some(sent),
+                },
+            )]),
+        )
+        .await;
+
+        let returned = seeker.find_providers(&wanted).await.unwrap();
+        assert_eq!(
+            returned.len(),
+            1,
+            "fixture: the scripted peer answers with exactly one record"
+        );
+        assert_eq!(
+            returned[0].unverified_mirror_coin_id, expected,
+            "the caller must receive the pointer normalized, not the raw value the peer sent"
+        );
+    }
+}
+
 /// Admission rule 3: the discovery cache normalizes `unverified_mirror_coin_id`, exactly as the
 /// authoritative store does and exactly as the sibling `addresses` field is already re-capped for
 /// these same records.

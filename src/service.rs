@@ -687,7 +687,7 @@ impl DhtService {
     /// duty over. Kept apart, the worst a fabricated record achieves is a wasted dial by the one
     /// node that cached it.
     ///
-    /// Three admission rules, in order:
+    /// Four admission rules, in order:
     ///
     /// 1. **Never cache a record naming THIS node.** It is useless as a dial target, and worse, it
     ///    would make the cache non-empty and so suppress the next real lookup — a peer that echoed
@@ -695,12 +695,13 @@ impl DhtService {
     /// 2. **Never cache a record for a different key.** The wire boundary already discards those
     ///    (SPEC §6.7); re-checking costs a string compare and this write outlives the lookup that
     ///    produced it, so the invariant is asserted rather than assumed.
-    /// 3. **Normalize `unverified_mirror_coin_id`** to canonical 64-hex or `None`. The sibling
-    ///    `addresses` field is already re-capped for these same records in
-    ///    [`find_providers`](Self::find_providers)'s post-lookup pass; leaving the pointer
-    ///    un-normalized beside it was an inconsistency, not a decision. A conforming transport
-    ///    cannot deliver an oversized pointer here today, so this is defence in depth — it means the
-    ///    cache holds the same shape as the authoritative store regardless of what arrives.
+    /// 3. **Normalize BOTH peer-controlled shape fields**: `unverified_mirror_coin_id` to canonical
+    ///    64-hex or `None`, and `addresses` through `sort_and_cap_addresses` (SPEC §5.5). The one
+    ///    caller today, [`find_providers`](Self::find_providers), already does both in its
+    ///    post-lookup pass, so this is defence in depth rather than a live fix — but that is a
+    ///    property of the caller, not of this write path, and a second caller added later must
+    ///    inherit the guarantee rather than be expected to remember it. A record reaching local
+    ///    state holds the same shape whichever path admitted it.
     /// 4. **Clamp the expiry DOWN to `now + discovery_cache_ttl`**, never up. A peer cannot extend
     ///    its residence in this node's cache by claiming a distant expiry, and a record that is
     ///    already expired is not cached at all.
@@ -719,6 +720,7 @@ impl DhtService {
                 continue;
             }
             let mut entry = record.clone();
+            crate::record::sort_and_cap_addresses(&mut entry.addresses);
             entry.unverified_mirror_coin_id =
                 crate::record::normalize_mirror_coin_id(entry.unverified_mirror_coin_id.as_deref());
             entry.expires_at = entry.expires_at.min(ceiling);
@@ -1226,7 +1228,7 @@ mod host_size_bound_tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::record::{CandidateAddr, MAX_HOST_LEN};
+    use crate::record::{CandidateAddr, MAX_ADDRESSES_PER_RECORD, MAX_HOST_LEN};
     use crate::wire::MAX_FRAMED_BODY;
 
     /// A transport that is never dialled: these tests only exercise local admission + the answer.
@@ -1327,6 +1329,65 @@ mod host_size_bound_tests {
         assert_eq!(
             cached[0].unverified_mirror_coin_id, None,
             "the cache must normalize the pointer itself, not rely on its caller having done it"
+        );
+    }
+
+    /// `cache_discovered`'s OWN address cap, called directly — the sibling of the pointer test
+    /// above, and blind in the same way for the same reason.
+    ///
+    /// Every end-to-end route into this write path runs through `find_providers`, which caps the
+    /// addresses before handing them here, so no swarm-level assertion can distinguish "the cache
+    /// caps" from "its one caller capped first". Calling the private write path directly is the
+    /// only fixture that can, and SPEC §6.8 admission rule 3 states the cap as a MUST **at the cache
+    /// write itself** — a normative claim that needs a test standing on that line alone.
+    ///
+    /// Both halves of the cap are exercised, because "drops the unrepresentable" and "bounds the
+    /// count" are different implementations: an over-long host must not be cached, an honest one
+    /// beside it must survive verbatim (a clear-everything fix fails that), and a list over
+    /// `MAX_ADDRESSES_PER_RECORD` must come back at the cap.
+    #[tokio::test]
+    async fn the_discovery_cache_caps_its_own_addresses() {
+        let svc = service();
+        let content = ContentId::store([0xC2; 32]);
+        let content_key = content.to_key().to_hex();
+
+        // One unrepresentable host, one honest control, then enough filler to exceed the count cap.
+        let mut addresses = vec![
+            CandidateAddr::direct(hostile_host(), 9444),
+            CandidateAddr::direct(HONEST_HOST, 9444),
+        ];
+        for i in 0..=MAX_ADDRESSES_PER_RECORD {
+            addresses.push(CandidateAddr::direct(format!("filler-{i}.example"), 9444));
+        }
+
+        svc.cache_discovered(
+            &content_key,
+            &[ProviderRecord {
+                content_key: content_key.clone(),
+                provider_peer_id: PeerId::from_bytes([0x72; 32]).to_hex(),
+                addresses,
+                expires_at: now_secs() + 60,
+                unverified_mirror_coin_id: None,
+            }],
+        )
+        .await;
+
+        let cached = svc.cached_providers(&content).await;
+        assert_eq!(cached.len(), 1, "the record should have been cached");
+        let hosts: Vec<String> = cached[0].addresses.iter().map(|a| a.host.clone()).collect();
+
+        assert!(
+            hosts.iter().all(|h| h.len() <= MAX_HOST_LEN),
+            "the cache must drop an unrepresentable host itself, not rely on its caller having done it"
+        );
+        assert!(
+            hosts.iter().any(|h| h == HONEST_HOST),
+            "the cap must drop only what it cannot represent — an ordinary host survives verbatim"
+        );
+        assert_eq!(
+            cached[0].addresses.len(),
+            MAX_ADDRESSES_PER_RECORD,
+            "the cache must bound the address COUNT itself as well as each entry's size"
         );
     }
 
