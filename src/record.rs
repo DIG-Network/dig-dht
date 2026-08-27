@@ -164,6 +164,25 @@ pub(crate) fn sort_addresses_ipv6_first(addresses: &mut [CandidateAddr]) {
 /// one address per kind per family) while remaining a small, cheap-to-clone constant.
 pub const MAX_ADDRESSES_PER_RECORD: usize = 8;
 
+/// Maximum byte length of a [`CandidateAddr::host`], and the reason it is a naming limit rather
+/// than a round number.
+///
+/// 253 is the maximum PRESENTATION length of a fully-qualified DNS name (RFC 1035 §2.3.4 bounds the
+/// wire form at 255 octets, of which the root label's length byte and terminator are not written in
+/// text form), so it admits every legal hostname. It also contains every IPv6 literal spelling with
+/// room to spare — the longest, a fully-expanded IPv4-mapped address carrying a zone id, is well
+/// under 100 characters. Nothing legitimate reaches it.
+///
+/// Without this bound `host` is unbounded: the struct's fields are `pub`, so a record decoded off
+/// the wire — or built by literal — can carry a body-sized host. The victim stores it, folds it into
+/// its routing table ([`crate::service`]'s admission pipeline), and re-serves it in every
+/// `Providers` answer for that key, which no outbound cap trims. Every querier's framing check then
+/// rejects the answer ([`MAX_FRAMED_BODY`](crate::wire::MAX_FRAMED_BODY)) and the key is
+/// undiscoverable through that node for a full TTL — and because the poisoned contact is in the
+/// routing table, it bloats the `closer` list of OTHER targets too. Capping the address COUNT does
+/// not close this: one address is enough.
+pub const MAX_HOST_LEN: usize = 253;
+
 /// Sort `addresses` **IPv6-first-then-rank** (see [`sort_addresses_ipv6_first`]) and then truncate
 /// to [`MAX_ADDRESSES_PER_RECORD`], so the most-preferred candidates are the ones kept when a list
 /// exceeds the cap. This is the one admission point both the constructors ([`ProviderRecord::new`],
@@ -172,7 +191,15 @@ pub const MAX_ADDRESSES_PER_RECORD: usize = 8;
 /// address list from any source that did not already go through it — a `ProviderRecord` /
 /// `Contact` deserialized directly from the wire bypasses the constructors entirely (their fields
 /// are public), so capping only in `new` would not close the untrusted-input path.
+///
+/// It also **bounds each entry**, not just their number: a candidate whose `host` exceeds
+/// [`MAX_HOST_LEN`] is DROPPED before the sort. Dropping rather than truncating is deliberate — a
+/// truncated host names a DIFFERENT, possibly real, endpoint, so trimming one would fabricate an
+/// address rather than discard an unusable one. Dropping follows the same normalize-never-reject
+/// rule the rest of this module holds: the record survives, minus the address that could not be
+/// represented, which is exactly as useful as a record that never carried it.
 pub(crate) fn sort_and_cap_addresses(addresses: &mut Vec<CandidateAddr>) {
+    addresses.retain(|a| a.host.len() <= MAX_HOST_LEN);
     sort_addresses_ipv6_first(addresses);
     addresses.truncate(MAX_ADDRESSES_PER_RECORD);
 }
@@ -393,8 +420,11 @@ pub struct ProviderRecord {
     /// lookup that misses or fails the bond check falls straight back to the hint scan. A mismatch
     /// is not grounds for blocklisting — it is indistinguishable from an epoch rollover.
     ///
-    /// Malformed values normalize to `None` at the wire boundary, so this is either a canonical
-    /// lowercase 64-hex string or absent — never attacker-shaped bytes.
+    /// Malformed values normalize to `None` at the wire boundary and again at admission, so on an
+    /// ADMITTED or STORED record this is either a canonical lowercase 64-hex string or absent. That
+    /// guarantee belongs to those records only: the field is `pub`, so a value that has not yet
+    /// passed either normalization can hold arbitrary attacker-shaped bytes of arbitrary length. A
+    /// consumer holding a record from any other source must normalize it itself.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",

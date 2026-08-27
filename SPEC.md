@@ -178,7 +178,7 @@ ProviderRecord = { "content_key":"<64hex>", "provider_peer_id":"<64hex>",
                    "unverified_mirror_coin_id"?:"<64hex>" }
 ```
 
-- `unverified_mirror_coin_id` is **OPTIONAL** (`?`) and is a POINTER, never evidence — see §6.6. A
+- `unverified_mirror_coin_id` is **OPTIONAL** (`?`) and is a POINTER, never evidence — see §6.9. A
   producer MUST omit the key entirely when it has no pointer; it MUST NOT emit `null`. A consumer
   MUST accept a record that omits it, and MUST tolerate unknown keys generally, so the record shape
   stays additively extensible in both directions.
@@ -221,6 +221,16 @@ ProviderRecord = { "content_key":"<64hex>", "provider_peer_id":"<64hex>",
   `find_providers` caller. This bounds per-record memory and the amplification of re-serving a
   received list to other peers without changing what a conforming peer may transmit or how a
   receiver decodes it.
+- **Each `host` is bounded to `MAX_HOST_LEN` (253 bytes), and the entry is DROPPED, not trimmed.**
+  Capping the address COUNT does not bound a record's size: one entry is enough. `host` carries no
+  length bound of its own on the wire, so a single candidate can hold a body-sized string, which the
+  receiver stores, folds into its routing table, and re-serves in every `Providers` answer for that
+  key — no outbound cap trims it — until the answer exceeds the framing ceiling (§5.2) and the key is
+  undiscoverable through that node for a full TTL. 253 is the maximum presentation length of a
+  fully-qualified DNS name, so it admits every legal hostname and every IPv6 literal spelling.
+  A candidate exceeding it MUST be REMOVED from the list before the sort — never truncated, since a
+  truncated host names a different endpoint — and, as with the count cap, this **bounds, never
+  rejects**: the record is admitted without that address, exactly as if it had never carried it.
 - **The cap MUST hold by construction at the decode boundary.** Deserializing a `ProviderRecord` or
   a `Contact` MUST itself sort-then-truncate `addresses` to `MAX_ADDRESSES_PER_RECORD`, so no
   deserialized value — from a peer's frame, a config file, or a cached snapshot — can carry an
@@ -282,51 +292,6 @@ reachable at `addresses`, until `expires_at`.* It is **soft state**, not a perma
   satisfy `now >= expires_at` and so would never be reclaimed by GC (§9.4) for the life of the
   process. The clamp bounds every third-party record to the responder's own TTL horizon
   regardless of what the announcer claims.
-
-### 6.6 The mirror-coin collateral pointer (`unverified_mirror_coin_id`)
-
-**The DHT is the primary discovery mechanism for stores and roots; the chain is the verification
-mechanism. The DHT does not, and cannot, prove collateralisation.** The incentive flow is therefore
-two steps — ask the DHT which nodes serve store X at root Y, then ask the chain whether each of
-those claims is actually bonded. This field makes step two a direct lookup instead of a search.
-
-- **Optional, and absence is normal.** A record MAY carry a 64-hex mirror-coin id. Old publishers,
-  publishers that have not created the coin yet, and publishers mid-epoch-rollover all legitimately
-  omit it. A verifier can always fall back to the hint scan, because all four terms of
-  `mirror_hint(store_launcher_id, root_hash, owner_puzzle_hash, epoch)` are known by then — store
-  and root from the claim, owner puzzle hash from the provider entry, epoch from the clock. **A node
-  that omits the pointer is slower to verify, not unverifiable, and MUST NOT be treated as
-  uncollateralised.**
-- **It is a POINTER, never evidence.** The publishing peer is untrusted (§14). A hostile or stale
-  peer can supply a real, well-formed, fully-collateralised coin id that bonds a DIFFERENT store,
-  root, epoch or owner — every property checks out except the one that matters.
-- **Consumer obligation.** A consumer that acts on the pointer MUST, against its own chain source:
-  1. verify the coin sits at the mirror-coin puzzle hash,
-  2. verify it is $DIG with the asset id re-derived from the creating spend,
-  3. verify it carries the full collateral, and
-  4. confirm the coin's DECLARED bond matches the claim — an exact equality on the declared
-     `(store, root, epoch)` triple, with the owner checked through the four-term `mirror_hint`.
-
-  Step 4 is what binds the coin to the claim; steps 1-3 alone prove only that *a* valid mirror coin
-  exists somewhere.
-- **A wrong pointer costs the publisher, not the verifier.** Verification MUST be bounded to a
-  single chain read with no retry loop, falling straight back to the hint scan on a miss or a failed
-  bond check. A mismatch MUST NOT be grounds for blocklisting — it is indistinguishable from an
-  epoch rollover.
-- **Normalization at EVERY ingress (wire contract).** A responder MUST NOT trust the field as
-  received, and MUST normalize it in the admission pipeline (§6.3) and not only when decoding a
-  frame: a record can also enter through an authenticated push (§6.4) as an already-constructed
-  value that no decoder ever saw. A value
-  that is not a 64-hex string — wrong length, non-hex, a non-string JSON type, or a body-sized
-  string — MUST be normalized to ABSENT rather than rejected: erroring would let any peer destroy a
-  whole provider record, and with it the discovery the DHT exists for, by appending one junk field.
-  A valid value MUST be stored lowercased, so two records naming one coin compare equal.
-  Normalizing at only one ingress is a defect: an unbounded pointer that reaches storage is
-  re-served in every `Providers` answer for that key, no outbound cap trims it, and the answer then
-  exceeds the framing ceiling (§5) for every querier — making the key undiscoverable through that
-  node for a full TTL, which is the exact denial this rule exists to prevent.
-- **No verification in this crate.** The DHT has no chain source. It carries the pointer and states
-  that it is untrusted; verification belongs to the consumer.
 
 ### 6.3 Provider store (per-node local state)
 
@@ -536,7 +501,10 @@ reads back — at a keyspace position this node has no `k`-closest duty over.
    our own record back at us pin us to a provider set we cannot use.
 2. A record whose `content_key` is not the queried key MUST NOT be cached. §6.7 already discards
    these at the wire boundary; the cache re-checks because this write outlives the lookup.
-3. The record's expiry MUST be clamped DOWN to `min(record.expires_at, now + discovery_cache_ttl)`,
+3. The record's `unverified_mirror_coin_id` MUST be normalized (§6.9) and its `addresses` capped
+   (§5.5), at the cache write itself rather than only in the lookup that feeds it. A record reaching
+   local state MUST hold the same shape whichever path admitted it.
+4. The record's expiry MUST be clamped DOWN to `min(record.expires_at, now + discovery_cache_ttl)`,
    never up, and a record already expired at `now` MUST NOT be cached. A peer therefore cannot
    lengthen its own residence in another node's cache by claiming a distant expiry.
 
@@ -577,6 +545,52 @@ per-node-local process state: never served (§10.1), never in `provider_snapshot
 and never persisted to disk by this crate. Its residence time is bounded by `discovery_cache_ttl`,
 which is therefore also the window in which a host-level compromise can read the node's recent
 interest set.
+
+### 6.9 The mirror-coin collateral pointer (`unverified_mirror_coin_id`)
+
+**The DHT is the primary discovery mechanism for stores and roots; the chain is the verification
+mechanism. The DHT does not, and cannot, prove collateralisation.** The incentive flow is therefore
+two steps — ask the DHT which nodes serve store X at root Y, then ask the chain whether each of
+those claims is actually bonded. This field makes step two a direct lookup instead of a search.
+
+- **Optional, and absence is normal.** A record MAY carry a 64-hex mirror-coin id. Old publishers,
+  publishers that have not created the coin yet, and publishers mid-epoch-rollover all legitimately
+  omit it. A verifier can always fall back to the hint scan, because all four terms of
+  `mirror_hint(store_launcher_id, root_hash, owner_puzzle_hash, epoch)` are known by then — store
+  and root from the claim, owner puzzle hash from the provider entry, epoch from the clock. **A node
+  that omits the pointer is slower to verify, not unverifiable, and MUST NOT be treated as
+  uncollateralised.**
+- **It is a POINTER, never evidence.** The publishing peer is untrusted (§14). A hostile or stale
+  peer can supply a real, well-formed, fully-collateralised coin id that bonds a DIFFERENT store,
+  root, epoch or owner — every property checks out except the one that matters.
+- **Consumer obligation.** A consumer that acts on the pointer MUST, against its own chain source:
+  1. verify the coin sits at the mirror-coin puzzle hash,
+  2. verify it is $DIG with the asset id re-derived from the creating spend,
+  3. verify it carries the full collateral, and
+  4. confirm the coin's DECLARED bond matches the claim — an exact equality on the declared
+     `(store, root, epoch)` triple, with the owner checked through the four-term `mirror_hint`.
+
+  Step 4 is what binds the coin to the claim; steps 1-3 alone prove only that *a* valid mirror coin
+  exists somewhere.
+- **A wrong pointer costs the publisher, not the verifier.** Verification MUST be bounded to a
+  single chain read with no retry loop, falling straight back to the hint scan on a miss or a failed
+  bond check. A mismatch MUST NOT be grounds for blocklisting — it is indistinguishable from an
+  epoch rollover.
+- **Normalization at EVERY ingress (wire contract).** A responder MUST NOT trust the field as
+  received, and MUST normalize it in the admission pipeline (§6.3) and not only when decoding a
+  frame: a record can also enter through an authenticated push (§6.4) as an already-constructed
+  value that no decoder ever saw. A value
+  that is not a 64-hex string — wrong length, non-hex, a non-string JSON type, or a body-sized
+  string — MUST be normalized to ABSENT rather than rejected: erroring would let any peer destroy a
+  whole provider record, and with it the discovery the DHT exists for, by appending one junk field.
+  A valid value MUST be stored lowercased, so two records naming one coin compare equal.
+  Normalizing at only one ingress is a defect: an unbounded pointer that reaches storage is
+  re-served in every `Providers` answer for that key, no outbound cap trims it, and the answer then
+  exceeds the framing ceiling (§5) for every querier — making the key undiscoverable through that
+  node for a full TTL, which is the exact denial this rule exists to prevent.
+- **No verification in this crate.** The DHT has no chain source. It carries the pointer and states
+  that it is untrusted; verification belongs to the consumer.
+
 
 ## 7. Routing table
 
@@ -689,7 +703,7 @@ and discovery would be impossible). For that, the routing table is also fed LIVE
   Replication is **best-effort**: a peer that errors is skipped. With no peers to ask, the local
   record stands and the return value is 0 — republish re-attempts once bootstrapped.
 - **`announce_provider_with_collateral(content, coin_id?)`** — as `announce_provider`, and
-  additionally publishes the node's claimed mirror-coin id on the record (§6.6). The pointer is
+  additionally publishes the node's claimed mirror-coin id on the record (§6.9). The pointer is
   per-CONTENT, because a mirror coin bonds a `(store, root, owner, epoch)` tuple, so a node
   announcing two stores has two different pointers. The node MUST remember the pointer alongside the
   announced key so republish re-attaches it (§9.3); re-announcing the same key with a new coin id
@@ -723,7 +737,7 @@ The embedding node MUST drive maintenance on the configured intervals:
 
 - **`republish()`** (every `republish_interval`) — for every announced content key: refresh the
   local record (new `expires_at = now + provider_ttl`), **re-attach that key's own collateral
-  pointer** (§6.6 — rebuilding the record without it would make a node look collateralised for one
+  pointer** (§6.9 — rebuilding the record without it would make a node look collateralised for one
   TTL and bare afterwards), and re-run the announce PUT at the current
   `k` closest peers. This keeps records alive while the node is online and heals placement as the
   network churns. `republish_interval` MUST be shorter than `provider_ttl`.
@@ -888,6 +902,11 @@ Invariant: **no single peer failure is ever fatal to a lookup.**
   every peer that later queries for it (bandwidth amplification). The cap is additionally enforced
   at the decode boundary itself (§5.5), so the bound holds by construction for every deserialized
   value rather than only at the ingest sites that remember to apply it.
+- **Per-address size bound.** Every admitted `host` is bounded at `MAX_HOST_LEN` (§5.5), applied in
+  the same shared normalization as the count cap, so both hold at every ingress. Without it one legal
+  `add_provider` makes a key's answer exceed the frame ceiling for every querier — a full-TTL
+  discovery denial for the cost of one request, amplified because the folded routing-table contact
+  bloats the `closer` list of unrelated targets too.
 - **Answer-to-question binding.** A finder discards provider records returned for a key it did not
   query (§6.7), before the early-exit decision and before returning anything to its caller — so a
   peer on the lookup path cannot fan out the finder's dial attempts or halt its walk with records it
@@ -919,7 +938,8 @@ Exported from the crate root (`#![forbid(unsafe_code)]`, MSRV **1.75.0**, licens
   `cached_providers(&ContentId)` / `forget_discovered(&ContentId)` (§6.8),
   `provider_snapshot(usize)`.
 - `DhtConfig` (§12), `ContentId` (§3–4), `Key` / `Distance` (§2), `ProviderRecord` /
-  `CandidateAddr` / `AddressKind` / `MAX_ADDRESSES_PER_RECORD` / `dial_candidates` /
+  `CandidateAddr` / `AddressKind` / `MAX_ADDRESSES_PER_RECORD` / `MAX_HOST_LEN` /
+  `dial_candidates` /
   `MAX_DIAL_CANDIDATES` (§5.5, §6) — `ProviderRecord::dial_candidates()` and
   `Contact::dial_candidates()` are the §5.2-compliant dial-order accessors, and `best_address()` on
   either type returns the first candidate only (display/logging, never a dial decision), `Contact` /
@@ -961,6 +981,7 @@ framing.
 | Address shape | `{host, port, kind}` with lowercase `kind` tokens, byte-compatible with L7 `dig.getPeers` (§5.5) | Results drop into dial targets |
 | Address ordering | IPv6-first (family key from canonical `dig_ip::Family`), then by `kind` rank (§5.5) | Dialers try IPv6 before IPv4, per the ecosystem IPv6-first/IPv4-fallback rule (CLAUDE.md §5.2) |
 | Address-list cap | `MAX_ADDRESSES_PER_RECORD` = 8, receive-side truncation post-sort, not a wire/decode limit (§5.5) | No record/contact can carry an unbounded address list; wire encoding is unaffected |
+| Per-address size cap | `MAX_HOST_LEN` = 253 (max FQDN presentation length); an over-long candidate is dropped at admission, not truncated (§5.5, §14) | One address cannot make a key's answer exceed the frame ceiling and go undiscoverable for a TTL |
 | Hex case | Lowercase 64-hex identifiers on the wire (§5.6) | Records remain findable |
 | Provider TTL | Absolute `expires_at` Unix seconds; expired at `now >= expires_at`; republish < TTL (§6.2, §12) | Stale providers age out uniformly |
 | Inbound TTL clamp | `add_provider`'s `expires_at` clamped to `min(received, now + local provider_ttl)` before storage (§6.2, §10.1) | A malicious/over-long expiry can never outlive local GC |

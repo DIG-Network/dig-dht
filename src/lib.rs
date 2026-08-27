@@ -65,7 +65,7 @@ pub use error::DhtError;
 pub use key::{Distance, Key};
 pub use record::{
     dial_candidates, AddressKind, CandidateAddr, ProviderRecord, MAX_ADDRESSES_PER_RECORD,
-    MAX_DIAL_CANDIDATES,
+    MAX_DIAL_CANDIDATES, MAX_HOST_LEN,
 };
 pub use routing::{Contact, RoutingTable};
 pub use service::{BootstrapPeer, DhtService};
