@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.15.0] - 2026-08-27
+
+### Bug Fixes
+- **record:** Bound CandidateAddr::host size at the shared address-normalization helper (#25)
+
 ## [0.14.0] - 2026-08-27
 
 ### Features
