@@ -20,7 +20,7 @@
 //!
 //! [`local_announcements`]: ProviderStore::local_announcements
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use crate::record::ProviderRecord;
 
@@ -118,8 +118,14 @@ pub struct ProviderSnapshot {
 pub struct ProviderStore {
     /// content_key (64-hex) → provider_peer_id (64-hex) → entry.
     by_key: HashMap<String, HashMap<String, ProviderEntry>>,
-    /// content keys (64-hex) this node holds + announces (for republish).
-    announced: HashSet<String>,
+    /// content keys (64-hex) this node holds + announces (for republish), each mapped to the
+    /// UNTRUSTED mirror-coin pointer to re-publish with it (`None` = no pointer, the normal case).
+    ///
+    /// A map rather than a set because the pointer is per-CONTENT: a mirror coin bonds a
+    /// `(store, root, owner, epoch)` tuple, so one node announcing two stores has two different
+    /// pointers. Holding it here is what stops [`republish`](crate::DhtService::republish) from
+    /// silently dropping the pointer on the first TTL rollover.
+    announced: HashMap<String, Option<String>>,
     /// Admission-control bounds enforced by [`put`](Self::put).
     limits: ProviderStoreLimits,
     /// Monotonic source of [`ProviderEntry::admitted_seq`] — the next admission's ordinal.
@@ -142,7 +148,7 @@ impl ProviderStore {
     pub fn with_limits(limits: ProviderStoreLimits) -> Self {
         ProviderStore {
             by_key: HashMap::new(),
-            announced: HashSet::new(),
+            announced: HashMap::new(),
             limits,
             next_admitted_seq: 0,
         }
@@ -352,20 +358,41 @@ impl ProviderStore {
     }
 
     /// Record that this node holds + announces `content_key` (so the maintenance loop republishes
-    /// it). Idempotent.
+    /// it), with no collateral pointer. Idempotent.
     pub fn mark_announced(&mut self, content_key: String) {
-        self.announced.insert(content_key);
+        self.announced.insert(content_key, None);
+    }
+
+    /// As [`mark_announced`](Self::mark_announced), but remembering the publisher's own
+    /// mirror-coin pointer so every republish of this key re-attaches it.
+    ///
+    /// The pointer is stored verbatim as this node's own claim; it is untrusted only when it
+    /// arrives from a peer. Idempotent, and last write wins — re-announcing with a fresh coin id
+    /// after an epoch rollover is the intended way to update it.
+    pub fn mark_announced_with_collateral(
+        &mut self,
+        content_key: String,
+        unverified_mirror_coin_id: Option<String>,
+    ) {
+        self.announced
+            .insert(content_key, unverified_mirror_coin_id);
+    }
+
+    /// The collateral pointer remembered for `content_key`, or `None` if the key is not announced
+    /// or was announced without one.
+    pub fn announced_collateral(&self, content_key: &str) -> Option<&str> {
+        self.announced.get(content_key).and_then(Option::as_deref)
     }
 
     /// Stop announcing `content_key` (this node no longer holds the content). Returns whether it was
     /// being announced.
     pub fn unmark_announced(&mut self, content_key: &str) -> bool {
-        self.announced.remove(content_key)
+        self.announced.remove(content_key).is_some()
     }
 
     /// The content keys this node announces (holds) — the republish work list.
     pub fn local_announcements(&self) -> Vec<String> {
-        self.announced.iter().cloned().collect()
+        self.announced.keys().cloned().collect()
     }
 
     /// A bounded, AGGREGATED view of what this node holds in its DHT provider store — content keys

@@ -177,6 +177,82 @@ pub(crate) fn sort_and_cap_addresses(addresses: &mut Vec<CandidateAddr>) {
     addresses.truncate(MAX_ADDRESSES_PER_RECORD);
 }
 
+/// Decode a canonical 64-hex string into 32 bytes, or `None` if it is not exactly 64 hex digits.
+///
+/// The ONE hex-decode in this crate (`peer_id`, content key and mirror-coin id all share this
+/// shape), so a second, subtly different decoder cannot drift into existence.
+pub(crate) fn hex64_to_bytes(hex: &str) -> Option<[u8; 32]> {
+    if hex.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, chunk) in hex.as_bytes().chunks(2).enumerate() {
+        let hi = (chunk[0] as char).to_digit(16)?;
+        let lo = (chunk[1] as char).to_digit(16)?;
+        out[i] = ((hi << 4) | lo) as u8;
+    }
+    Some(out)
+}
+
+/// Encode 32 bytes as canonical lowercase 64-hex — the inverse of [`hex64_to_bytes`].
+pub(crate) fn to_hex64(bytes: &[u8; 32]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(64);
+    for b in bytes {
+        let _ = write!(out, "{b:02x}");
+    }
+    out
+}
+
+/// Normalize an [`unverified_mirror_coin_id`](ProviderRecord::unverified_mirror_coin_id) to its
+/// canonical form: a lowercase 64-hex string, or `None` for anything else.
+///
+/// **Normalize, never reject.** This field is attacker-supplied and OPTIONAL, so a malformed value
+/// must cost the record nothing: erroring would let any peer destroy a whole provider record - and
+/// with it the discovery the DHT exists for - by appending one junk field. Dropping it instead
+/// leaves the record exactly as useful as one that never carried a pointer, which is the defined
+/// fallback.
+///
+/// It also BOUNDS the field, which is why it runs at EVERY ingress rather than only at the wire.
+/// The value is otherwise unbounded: the struct's fields are `pub`, so a record built by literal -
+/// how a consumer folds a verified holdings-announce in - can carry a 256 KiB pointer (the frame
+/// ceiling, [`MAX_FRAMED_BODY`](crate::wire::MAX_FRAMED_BODY)). Stored verbatim it is re-served in
+/// every `Providers` response for that key, which no outbound cap trims, so every querier's framing
+/// check rejects the answer and the key goes undiscoverable through this node for a full TTL. That
+/// is the same amplification the address cap closes, and the same discovery denial this
+/// normalize-never-reject rule exists to prevent.
+///
+/// Lowercasing is not cosmetic: without it the same coin published in two cases yields two
+/// non-equal records, so dedup and equality would split on presentation.
+pub(crate) fn normalize_mirror_coin_id(raw: Option<&str>) -> Option<String> {
+    raw.map(str::to_ascii_lowercase)
+        .filter(|s| hex64_to_bytes(s).is_some())
+}
+
+/// Wire-boundary normalization for
+/// [`unverified_mirror_coin_id`](ProviderRecord::unverified_mirror_coin_id): anything that is not a
+/// 64-hex string becomes `None`, and a valid one is lowercased.
+///
+/// **Normalize, never reject.** This field is attacker-supplied and OPTIONAL, so a malformed value
+/// must cost the record nothing: erroring here would let any peer destroy a whole provider record —
+/// and with it the discovery the DHT exists for — by appending one junk field. Dropping it instead
+/// leaves the record exactly as useful as one that never carried a pointer, which is the defined
+/// fallback. It also bounds the field: a peer can otherwise put a body-sized string here (the frame
+/// ceiling is [`MAX_FRAMED_BODY`](crate::wire::MAX_FRAMED_BODY), 256 KiB) which the victim would
+/// store AND re-serve to every querying peer — the same amplification the address cap closes.
+///
+/// Lowercasing is not cosmetic: without it the same coin published in two cases yields two
+/// non-equal records, so dedup and equality would split on presentation.
+fn deserialize_mirror_coin_id<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(normalize_mirror_coin_id(
+        raw.as_ref().and_then(|v| v.as_str()),
+    ))
+}
+
 /// Upper bound on how many candidates [`dial_candidates`] hands a dialer for ONE peer, so a record
 /// padded with addresses cannot turn a single holder into a connect storm. Byte-for-byte the same
 /// bound dig-download applies on its own dial path, so a consumer that adopts this iterator sees no
@@ -287,6 +363,44 @@ pub struct ProviderRecord {
     pub addresses: Vec<CandidateAddr>,
     /// Absolute expiry (Unix seconds). A record at/after this time is stale.
     pub expires_at: u64,
+    /// **UNTRUSTED POINTER, NOT EVIDENCE** — an optional 64-hex mirror-coin id the publisher claims
+    /// bonds this `(store, root)` claim, carried so a verifier can fetch ONE coin instead of
+    /// scanning by hint.
+    ///
+    /// Holding this proves nothing whatsoever. Any peer can publish any 32 bytes, and a hostile or
+    /// merely stale publisher can supply a real, well-formed, fully-collateralised coin id that
+    /// bonds a **different** store, a different root, a different epoch, or a different owner —
+    /// every property checks out except the one that matters. A consumer MUST, against its own
+    /// chain source:
+    ///
+    /// 1. fetch the coin and verify it sits at `dig_mirror_coin::mirror_coin_puzzle_hash()`,
+    /// 2. verify it is $DIG with the asset id re-derived from the creating spend,
+    /// 3. verify it carries the full collateral, and
+    /// 4. confirm the coin's DECLARED bond matches the claim — `advertises(store, root, epoch)` is
+    ///    an exact equality on the declared triple, and the owner is checked against the four-term
+    ///    `dig_mirror_coin::mirror_hint(store, root, owner_puzzle_hash, epoch)`.
+    ///
+    /// Step 4 is what binds the coin to the claim; 1-3 alone prove only that *a* valid mirror coin
+    /// exists somewhere. No verification happens in this crate — the DHT has no chain source.
+    ///
+    /// **Absence is normal and must never degrade discovery.** Old publishers, publishers that have
+    /// not created the coin yet, and publishers mid-epoch-rollover all legitimately omit it; a
+    /// republished record can also carry a pointer that has since gone stale across an epoch
+    /// boundary. The fallback is the existing hint scan (`dig-mirror-coin`'s `discover` / `list`),
+    /// which is slower, not weaker. Treating a missing pointer as "uncollateralised" is a defect.
+    ///
+    /// **A wrong pointer costs the publisher, not the verifier.** One chain read, no retry loop: a
+    /// lookup that misses or fails the bond check falls straight back to the hint scan. A mismatch
+    /// is not grounds for blocklisting — it is indistinguishable from an epoch rollover.
+    ///
+    /// Malformed values normalize to `None` at the wire boundary, so this is either a canonical
+    /// lowercase 64-hex string or absent — never attacker-shaped bytes.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_mirror_coin_id"
+    )]
+    pub unverified_mirror_coin_id: Option<String>,
 }
 
 impl ProviderRecord {
@@ -304,7 +418,31 @@ impl ProviderRecord {
             provider_peer_id: provider.to_hex(),
             addresses,
             expires_at,
+            unverified_mirror_coin_id: None,
         }
+    }
+
+    /// Attach the publisher's claimed mirror-coin id — see
+    /// [`unverified_mirror_coin_id`](ProviderRecord::unverified_mirror_coin_id) for why holding it
+    /// proves nothing. Stored canonically (lowercase 64-hex) so two records naming the same coin are
+    /// byte-identical.
+    ///
+    /// Kept off [`new`](ProviderRecord::new) deliberately: the pointer is per-CONTENT rather than
+    /// per-node, because a mirror coin bonds a `(store, root, owner, epoch)` tuple, so only the
+    /// caller that knows which content it is announcing can supply it.
+    pub fn with_unverified_mirror_coin_id(mut self, coin_id: [u8; 32]) -> Self {
+        self.unverified_mirror_coin_id = Some(to_hex64(&coin_id));
+        self
+    }
+
+    /// The claimed mirror-coin id as 32 bytes, or `None` when absent (the normal fallback case).
+    ///
+    /// **The bytes are a lookup key, never a fact.** Returning `Some` means a publisher said
+    /// something, not that a collateral coin exists.
+    pub fn unverified_mirror_coin_id_bytes(&self) -> Option<[u8; 32]> {
+        self.unverified_mirror_coin_id
+            .as_deref()
+            .and_then(hex64_to_bytes)
     }
 
     /// The provider's `peer_id` decoded from the 64-hex field, or `None` if malformed.
@@ -343,6 +481,179 @@ mod tests {
 
     fn pid(b: u8) -> PeerId {
         PeerId::from_bytes([b; 32])
+    }
+
+    /// The 32 bytes a well-formed pointer decodes to, and its canonical lowercase spelling.
+    const COIN_ID: [u8; 32] = [
+        0x9a, 0x0b, 0xff, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x10, 0x20, 0x30, 0x40,
+        0x50, 0x60, 0x70, 0x80, 0x90, 0xa0, 0xb0, 0xc0, 0xd0, 0xe0, 0xf0, 0x11, 0x22, 0x33, 0x44,
+        0x55, 0x66,
+    ];
+    const COIN_ID_HEX: &str = "9a0bff0123456789abcdef102030405060708090a0b0c0d0e0f0112233445566";
+
+    fn plain_record() -> ProviderRecord {
+        ProviderRecord::new(
+            &Key::from_bytes([0xAB; 32]),
+            &pid(0x07),
+            vec![CandidateAddr::direct("203.0.113.7", 9444)],
+            1_000,
+        )
+    }
+
+    /// The pre-pointer record shape, byte-for-byte. A record produced by THIS crate must still
+    /// deserialize into it — that is what "an old peer parses a new record" means, and it is the
+    /// half a same-crate round-trip test cannot see.
+    #[derive(serde::Deserialize)]
+    struct LegacyProviderRecord {
+        content_key: String,
+        provider_peer_id: String,
+        addresses: Vec<CandidateAddr>,
+        expires_at: u64,
+    }
+
+    #[test]
+    fn a_pointer_round_trips_and_decodes_to_its_bytes() {
+        let rec = plain_record().with_unverified_mirror_coin_id(COIN_ID);
+        assert_eq!(rec.unverified_mirror_coin_id.as_deref(), Some(COIN_ID_HEX));
+
+        let json = serde_json::to_string(&rec).unwrap();
+        let back: ProviderRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, rec);
+        assert_eq!(back.unverified_mirror_coin_id_bytes(), Some(COIN_ID));
+    }
+
+    /// An OLD peer must parse a NEW record. Deserializing into the legacy shape proves the addition
+    /// is tolerated as an unknown field rather than merely being self-consistent.
+    #[test]
+    fn an_old_peer_parses_a_record_carrying_the_new_pointer() {
+        let rec = plain_record().with_unverified_mirror_coin_id(COIN_ID);
+        let json = serde_json::to_string(&rec).unwrap();
+
+        let legacy: LegacyProviderRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(legacy.content_key, rec.content_key);
+        assert_eq!(legacy.provider_peer_id, rec.provider_peer_id);
+        assert_eq!(legacy.addresses, rec.addresses);
+        assert_eq!(legacy.expires_at, rec.expires_at);
+    }
+
+    /// A NEW peer must parse an OLD record — absence is the normal case, never an error.
+    #[test]
+    fn a_new_peer_parses_a_record_with_no_pointer_field_at_all() {
+        let legacy_json = r#"{
+            "content_key": "abababababababababababababababababababababababababababababababab",
+            "provider_peer_id": "0707070707070707070707070707070707070707070707070707070707070707",
+            "addresses": [{"host":"203.0.113.7","port":9444,"kind":"direct"}],
+            "expires_at": 1000
+        }"#;
+        let rec: ProviderRecord = serde_json::from_str(legacy_json).unwrap();
+        assert_eq!(rec.unverified_mirror_coin_id, None);
+        assert_eq!(rec.unverified_mirror_coin_id_bytes(), None);
+        assert_eq!(rec, plain_record());
+    }
+
+    /// An absent pointer must be OMITTED from the wire, not emitted as `null`, so a record from a
+    /// publisher with no coin is byte-identical to one from a pre-pointer publisher.
+    #[test]
+    fn an_absent_pointer_is_omitted_from_the_wire_entirely() {
+        let json = serde_json::to_string(&plain_record()).unwrap();
+        assert!(
+            !json.contains("unverified_mirror_coin_id"),
+            "absent pointer leaked onto the wire: {json}"
+        );
+        assert!(
+            !json.contains("null"),
+            "absent pointer emitted as null: {json}"
+        );
+    }
+
+    /// Every malformed shape a hostile peer can put in the field normalizes to `None` — and NONE of
+    /// them may fail the parse. Erroring would let one junk field destroy a whole provider record,
+    /// which turns an optional convenience into a discovery-denial primitive.
+    ///
+    /// The oversize case is sized FROM the protocol limit: `wire::MAX_FRAMED_BODY` is 256 KiB, so a
+    /// peer really can put ~256 KiB here inside one legal frame.
+    #[test]
+    fn every_malformed_pointer_normalizes_to_none_without_failing_the_record() {
+        let oversize = "a".repeat(crate::wire::MAX_FRAMED_BODY - 512);
+        let cases: Vec<(&str, String)> = vec![
+            ("json null", "null".to_string()),
+            ("empty string", "\"\"".to_string()),
+            ("63 hex (one under)", format!("\"{}\"", "a".repeat(63))),
+            ("65 hex (one over)", format!("\"{}\"", "a".repeat(65))),
+            ("64 chars, not hex", format!("\"{}\"", "z".repeat(64))),
+            ("a number", "12345".to_string()),
+            ("a bool", "true".to_string()),
+            ("an object", "{\"coin\":1}".to_string()),
+            ("an array", "[1,2,3]".to_string()),
+            ("body-sized string", format!("\"{oversize}\"")),
+        ];
+
+        for (label, value) in cases {
+            let json = format!(
+                r#"{{
+                    "content_key": "abababababababababababababababababababababababababababababababab",
+                    "provider_peer_id": "0707070707070707070707070707070707070707070707070707070707070707",
+                    "addresses": [{{"host":"203.0.113.7","port":9444,"kind":"direct"}}],
+                    "expires_at": 1000,
+                    "unverified_mirror_coin_id": {value}
+                }}"#
+            );
+            let rec: ProviderRecord = serde_json::from_str(&json)
+                .unwrap_or_else(|e| panic!("{label} must not fail the record parse: {e}"));
+            assert_eq!(
+                rec.unverified_mirror_coin_id, None,
+                "{label} should have normalized to None"
+            );
+            // The rest of the record survives intact — a junk pointer degrades to the no-pointer
+            // case, which is exactly as useful as before.
+            assert_eq!(
+                rec,
+                plain_record(),
+                "{label} damaged the rest of the record"
+            );
+        }
+    }
+
+    /// The 64-hex bound pinned from BOTH sides: at-bound passes, one over fails. Tested through the
+    /// wire boundary so it pins the field, not only the helper.
+    #[test]
+    fn the_sixty_four_hex_bound_holds_from_both_sides() {
+        assert!(
+            hex64_to_bytes(&"a".repeat(64)).is_some(),
+            "at-bound must decode"
+        );
+        assert!(
+            hex64_to_bytes(&"a".repeat(65)).is_none(),
+            "one over must not decode"
+        );
+        assert!(
+            hex64_to_bytes(&"a".repeat(63)).is_none(),
+            "one under must not decode"
+        );
+    }
+
+    /// Uppercase hex is a valid id in a different presentation. It must decode to the SAME bytes and
+    /// be stored canonically, or two records naming one coin compare unequal and dedup splits.
+    #[test]
+    fn an_uppercase_pointer_is_canonicalized_rather_than_dropped() {
+        let json = format!(
+            r#"{{
+                "content_key": "abababababababababababababababababababababababababababababababab",
+                "provider_peer_id": "0707070707070707070707070707070707070707070707070707070707070707",
+                "addresses": [{{"host":"203.0.113.7","port":9444,"kind":"direct"}}],
+                "expires_at": 1000,
+                "unverified_mirror_coin_id": "{}"
+            }}"#,
+            COIN_ID_HEX.to_ascii_uppercase()
+        );
+        let rec: ProviderRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(rec.unverified_mirror_coin_id.as_deref(), Some(COIN_ID_HEX));
+        assert_eq!(rec.unverified_mirror_coin_id_bytes(), Some(COIN_ID));
+        assert_eq!(
+            rec,
+            plain_record().with_unverified_mirror_coin_id(COIN_ID),
+            "the same coin in two cases must produce equal records"
+        );
     }
 
     #[test]

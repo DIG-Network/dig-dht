@@ -174,8 +174,14 @@ A responder that cannot answer returns:
 Contact        = { "peer_id":"<64hex>", "addresses":[CandidateAddr] }
 CandidateAddr  = { "host":<string>, "port":<u16>, "kind":"direct"|"mapped"|"reflexive"|"relay" }
 ProviderRecord = { "content_key":"<64hex>", "provider_peer_id":"<64hex>",
-                   "addresses":[CandidateAddr], "expires_at":<u64 unix-seconds> }
+                   "addresses":[CandidateAddr], "expires_at":<u64 unix-seconds>,
+                   "unverified_mirror_coin_id"?:"<64hex>" }
 ```
+
+- `unverified_mirror_coin_id` is **OPTIONAL** (`?`) and is a POINTER, never evidence — see §6.6. A
+  producer MUST omit the key entirely when it has no pointer; it MUST NOT emit `null`. A consumer
+  MUST accept a record that omits it, and MUST tolerate unknown keys generally, so the record shape
+  stays additively extensible in both directions.
 
 - The `CandidateAddr` shape and the lowercase `kind` tokens are **byte-compatible with the L7
   `dig.getPeers` `addresses[]` shape** (Peer network §7), so a returned `Contact` or
@@ -276,6 +282,51 @@ reachable at `addresses`, until `expires_at`.* It is **soft state**, not a perma
   satisfy `now >= expires_at` and so would never be reclaimed by GC (§9.4) for the life of the
   process. The clamp bounds every third-party record to the responder's own TTL horizon
   regardless of what the announcer claims.
+
+### 6.6 The mirror-coin collateral pointer (`unverified_mirror_coin_id`)
+
+**The DHT is the primary discovery mechanism for stores and roots; the chain is the verification
+mechanism. The DHT does not, and cannot, prove collateralisation.** The incentive flow is therefore
+two steps — ask the DHT which nodes serve store X at root Y, then ask the chain whether each of
+those claims is actually bonded. This field makes step two a direct lookup instead of a search.
+
+- **Optional, and absence is normal.** A record MAY carry a 64-hex mirror-coin id. Old publishers,
+  publishers that have not created the coin yet, and publishers mid-epoch-rollover all legitimately
+  omit it. A verifier can always fall back to the hint scan, because all four terms of
+  `mirror_hint(store_launcher_id, root_hash, owner_puzzle_hash, epoch)` are known by then — store
+  and root from the claim, owner puzzle hash from the provider entry, epoch from the clock. **A node
+  that omits the pointer is slower to verify, not unverifiable, and MUST NOT be treated as
+  uncollateralised.**
+- **It is a POINTER, never evidence.** The publishing peer is untrusted (§14). A hostile or stale
+  peer can supply a real, well-formed, fully-collateralised coin id that bonds a DIFFERENT store,
+  root, epoch or owner — every property checks out except the one that matters.
+- **Consumer obligation.** A consumer that acts on the pointer MUST, against its own chain source:
+  1. verify the coin sits at the mirror-coin puzzle hash,
+  2. verify it is $DIG with the asset id re-derived from the creating spend,
+  3. verify it carries the full collateral, and
+  4. confirm the coin's DECLARED bond matches the claim — an exact equality on the declared
+     `(store, root, epoch)` triple, with the owner checked through the four-term `mirror_hint`.
+
+  Step 4 is what binds the coin to the claim; steps 1-3 alone prove only that *a* valid mirror coin
+  exists somewhere.
+- **A wrong pointer costs the publisher, not the verifier.** Verification MUST be bounded to a
+  single chain read with no retry loop, falling straight back to the hint scan on a miss or a failed
+  bond check. A mismatch MUST NOT be grounds for blocklisting — it is indistinguishable from an
+  epoch rollover.
+- **Normalization at EVERY ingress (wire contract).** A responder MUST NOT trust the field as
+  received, and MUST normalize it in the admission pipeline (§6.3) and not only when decoding a
+  frame: a record can also enter through an authenticated push (§6.4) as an already-constructed
+  value that no decoder ever saw. A value
+  that is not a 64-hex string — wrong length, non-hex, a non-string JSON type, or a body-sized
+  string — MUST be normalized to ABSENT rather than rejected: erroring would let any peer destroy a
+  whole provider record, and with it the discovery the DHT exists for, by appending one junk field.
+  A valid value MUST be stored lowercased, so two records naming one coin compare equal.
+  Normalizing at only one ingress is a defect: an unbounded pointer that reaches storage is
+  re-served in every `Providers` answer for that key, no outbound cap trims it, and the answer then
+  exceeds the framing ceiling (§5) for every querier — making the key undiscoverable through that
+  node for a full TTL, which is the exact denial this rule exists to prevent.
+- **No verification in this crate.** The DHT has no chain source. It carries the pointer and states
+  that it is untrusted; verification belongs to the consumer.
 
 ### 6.3 Provider store (per-node local state)
 
@@ -637,6 +688,12 @@ and discovery would be impossible). For that, the routing table is also fed LIVE
   of the converged `k` closest peers (skipping self). Returns the count of peers that accepted.
   Replication is **best-effort**: a peer that errors is skipped. With no peers to ask, the local
   record stands and the return value is 0 — republish re-attempts once bootstrapped.
+- **`announce_provider_with_collateral(content, coin_id?)`** — as `announce_provider`, and
+  additionally publishes the node's claimed mirror-coin id on the record (§6.6). The pointer is
+  per-CONTENT, because a mirror coin bonds a `(store, root, owner, epoch)` tuple, so a node
+  announcing two stores has two different pointers. The node MUST remember the pointer alongside the
+  announced key so republish re-attaches it (§9.3); re-announcing the same key with a new coin id
+  REPLACES the pointer, which is how an epoch rollover is published.
 - **`withdraw_provider(content)`** — stop republishing the key. The record is NOT actively deleted
   from other nodes; it ages out via TTL. Returns whether the key was being announced.
 - **`find_providers(content)`** — merge (a) locally held live records for the key and (b) the
@@ -665,7 +722,9 @@ LRS-report is left to ping-and-replace maintenance — lookups never block on a 
 The embedding node MUST drive maintenance on the configured intervals:
 
 - **`republish()`** (every `republish_interval`) — for every announced content key: refresh the
-  local record (new `expires_at = now + provider_ttl`) and re-run the announce PUT at the current
+  local record (new `expires_at = now + provider_ttl`), **re-attach that key's own collateral
+  pointer** (§6.6 — rebuilding the record without it would make a node look collateralised for one
+  TTL and bare afterwards), and re-run the announce PUT at the current
   `k` closest peers. This keeps records alive while the node is online and heals placement as the
   network churns. `republish_interval` MUST be shorter than `provider_ttl`.
 - **`refresh_buckets()`** (every `refresh_interval`) — for every **non-empty** bucket, look up a
