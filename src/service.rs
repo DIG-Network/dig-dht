@@ -229,9 +229,14 @@ impl DhtService {
         // `ProviderRecord::new`'s address cap — capped here before they are cached or handed back
         // to our caller (SPEC §5.5, §14). Records for a key we did not query were already discarded
         // at the wire boundary in `run_lookup`'s query closure (SPEC §6.7).
+        // Discovered records go to the CALLER as well as the cache, so both fields a peer controls
+        // are normalized here — the address list and the collateral pointer. Normalizing only on the
+        // way into the cache would hand the caller the raw value.
         let mut discovered = result.providers;
         for r in &mut discovered {
             crate::record::sort_and_cap_addresses(&mut r.addresses);
+            r.unverified_mirror_coin_id =
+                crate::record::normalize_mirror_coin_id(r.unverified_mirror_coin_id.as_deref());
         }
         self.cache_discovered(&key_hex, &discovered).await;
 
@@ -690,7 +695,13 @@ impl DhtService {
     /// 2. **Never cache a record for a different key.** The wire boundary already discards those
     ///    (SPEC §6.7); re-checking costs a string compare and this write outlives the lookup that
     ///    produced it, so the invariant is asserted rather than assumed.
-    /// 3. **Clamp the expiry DOWN to `now + discovery_cache_ttl`**, never up. A peer cannot extend
+    /// 3. **Normalize `unverified_mirror_coin_id`** to canonical 64-hex or `None`. The sibling
+    ///    `addresses` field is already re-capped for these same records in
+    ///    [`find_providers`](Self::find_providers)'s post-lookup pass; leaving the pointer
+    ///    un-normalized beside it was an inconsistency, not a decision. A conforming transport
+    ///    cannot deliver an oversized pointer here today, so this is defence in depth — it means the
+    ///    cache holds the same shape as the authoritative store regardless of what arrives.
+    /// 4. **Clamp the expiry DOWN to `now + discovery_cache_ttl`**, never up. A peer cannot extend
     ///    its residence in this node's cache by claiming a distant expiry, and a record that is
     ///    already expired is not cached at all.
     ///
@@ -708,6 +719,8 @@ impl DhtService {
                 continue;
             }
             let mut entry = record.clone();
+            entry.unverified_mirror_coin_id =
+                crate::record::normalize_mirror_coin_id(entry.unverified_mirror_coin_id.as_deref());
             entry.expires_at = entry.expires_at.min(ceiling);
             if entry.is_expired(now) {
                 continue;
@@ -1202,5 +1215,175 @@ mod provider_snapshot_tests {
         assert_eq!(snap.entries.len(), 2);
         assert!(snap.truncated);
         assert_eq!(snap.total_keys, 6, "the true total survives truncation");
+    }
+}
+
+/// The `CandidateAddr::host` size bound, exercised through the PUBLIC `handle_request` ingress —
+/// the reachable one. A record arriving there is decoded into a struct whose fields are all `pub`,
+/// so a test that only goes through a constructor proves nothing about the attacker's path.
+#[cfg(test)]
+mod host_size_bound_tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::record::{CandidateAddr, MAX_HOST_LEN};
+    use crate::wire::MAX_FRAMED_BODY;
+
+    /// A transport that is never dialled: these tests only exercise local admission + the answer.
+    struct UnusedTransport;
+
+    #[async_trait::async_trait]
+    impl crate::transport::DhtTransport for UnusedTransport {
+        async fn rpc(
+            &self,
+            _from: &Contact,
+            _peer: &Contact,
+            _request: &DhtRequest,
+        ) -> Result<DhtResponse, DhtError> {
+            unreachable!("host-size-bound tests never dial a peer")
+        }
+    }
+
+    fn service() -> DhtService {
+        DhtService::new(
+            PeerId::from_bytes([9u8; 32]),
+            vec![CandidateAddr::direct("local.example", 9444)],
+            DhtConfig::default(),
+            Arc::new(UnusedTransport),
+        )
+    }
+
+    /// The control's host — an ordinary name, well under the bound, which must survive UNCHANGED.
+    /// Without it, a fix that simply cleared every `host` would pass both assertions below while
+    /// destroying the addresses the DHT exists to hand out.
+    const HONEST_HOST: &str = "holder.example";
+
+    /// The hostile host, sized FROM the protocol's own ceiling rather than from a round number: a
+    /// single `MAX_FRAMED_BODY`-byte host makes this key's answer exceed the frame limit on its own,
+    /// which is precisely the harm — every querier's `decode_framed` then rejects the answer and the
+    /// key is undiscoverable through this node until the record expires.
+    fn hostile_host() -> String {
+        "a".repeat(MAX_FRAMED_BODY)
+    }
+
+    /// Announce `host` for `content_seed` through the public ingress, then return this node's answer
+    /// to a `FindProviders` for that key — the exact bytes a querier would have to decode.
+    async fn announce_then_answer(
+        svc: &DhtService,
+        content_seed: u8,
+        provider_seed: u8,
+        host: String,
+    ) -> DhtResponse {
+        let content = ContentId::store([content_seed; 32]);
+        let content_key = content.to_key().to_hex();
+
+        let accepted = svc
+            .handle_request(DhtRequest::AddProvider {
+                record: ProviderRecord {
+                    content_key: content_key.clone(),
+                    provider_peer_id: PeerId::from_bytes([provider_seed; 32]).to_hex(),
+                    addresses: vec![CandidateAddr::direct(host, 9444)],
+                    expires_at: now_secs() + 3600,
+                    unverified_mirror_coin_id: None,
+                },
+            })
+            .await;
+        assert!(
+            matches!(accepted, DhtResponse::AddProviderOk),
+            "the announce must be ACCEPTED — the bound normalizes the record, it does not reject it"
+        );
+
+        svc.handle_request(DhtRequest::FindProviders { content_key })
+            .await
+    }
+
+    /// `cache_discovered`'s OWN pointer normalization, called directly.
+    ///
+    /// The end-to-end swarm test for this exercises `find_providers`, which normalizes the record
+    /// before handing it here — so that test passes with or without this line and cannot speak for
+    /// it. This one calls the private write path directly, which is the only way to show the layer
+    /// is real rather than carried by its single current caller. That is the whole point of the
+    /// line: a second caller added later inherits the guarantee.
+    #[tokio::test]
+    async fn the_discovery_cache_normalizes_its_own_pointer() {
+        let svc = service();
+        let content = ContentId::store([0xC1; 32]);
+        let content_key = content.to_key().to_hex();
+
+        svc.cache_discovered(
+            &content_key,
+            &[ProviderRecord {
+                content_key: content_key.clone(),
+                provider_peer_id: PeerId::from_bytes([0x71; 32]).to_hex(),
+                addresses: vec![CandidateAddr::direct(HONEST_HOST, 9444)],
+                expires_at: now_secs() + 60,
+                unverified_mirror_coin_id: Some(hostile_host()),
+            }],
+        )
+        .await;
+
+        let cached = svc.cached_providers(&content).await;
+        assert_eq!(cached.len(), 1, "the record should have been cached");
+        assert_eq!(
+            cached[0].unverified_mirror_coin_id, None,
+            "the cache must normalize the pointer itself, not rely on its caller having done it"
+        );
+    }
+
+    fn stored_hosts(answer: &DhtResponse) -> Vec<String> {
+        match answer {
+            DhtResponse::Providers { providers, .. } => providers
+                .iter()
+                .flat_map(|r| r.addresses.iter())
+                .map(|a| a.host.clone())
+                .collect(),
+            other => panic!("expected a Providers answer, got {other:?}"),
+        }
+    }
+
+    /// ASSERTION 1 — the oversized host does not survive admission, while an honest one does.
+    ///
+    /// Deliberately separate from the frame-size assertion below: the two are not carried by one
+    /// another, and keeping them apart is what proves it. This one can be satisfied by a bound
+    /// placed anywhere on the write path; the frame assertion names the actual harm.
+    #[tokio::test]
+    async fn an_oversized_host_does_not_survive_admission_and_an_honest_one_does() {
+        let svc = service();
+
+        let hostile = announce_then_answer(&svc, 1, 0x41, hostile_host()).await;
+        assert!(
+            stored_hosts(&hostile)
+                .iter()
+                .all(|h| h.len() <= MAX_HOST_LEN),
+            "an over-long host was stored and re-served"
+        );
+
+        let honest = announce_then_answer(&svc, 2, 0x42, HONEST_HOST.to_string()).await;
+        assert_eq!(
+            stored_hosts(&honest),
+            vec![HONEST_HOST.to_string()],
+            "the bound must drop only what it cannot represent — an ordinary host survives verbatim"
+        );
+    }
+
+    /// ASSERTION 2 — the answer this node serves for the attacked key stays inside the protocol's
+    /// frame ceiling, so it remains decodable by every querier.
+    ///
+    /// This is the assertion that names the harm, and the one a future refactor is least likely to
+    /// break by accident. It is checked on a service that has ALSO admitted an honest record, so the
+    /// `closer` list the poisoned contact bloats is genuinely populated.
+    #[tokio::test]
+    async fn the_answer_for_an_attacked_key_stays_within_the_frame_ceiling() {
+        let svc = service();
+
+        announce_then_answer(&svc, 2, 0x42, HONEST_HOST.to_string()).await;
+        let answer = announce_then_answer(&svc, 1, 0x41, hostile_host()).await;
+
+        let frame = answer.encode();
+        assert!(
+            frame.len() <= MAX_FRAMED_BODY,
+            "the answer for this key is unservable at {} bytes (ceiling {MAX_FRAMED_BODY})",
+            frame.len()
+        );
     }
 }

@@ -43,7 +43,7 @@ Textbook Kademlia (Maymounkov & Mazières), specialized to DIG content discovery
   engine serves both `find_node` and `find_providers`.
 - **Provider records** are the point: `(content_key, provider_peer_id, addresses, expires_at)`.
   A record MAY also carry an OPTIONAL `unverified_mirror_coin_id` — a POINTER to the collateral
-  coin, never evidence of it. The DHT discovers; the chain verifies. See SPEC.md 6.6.
+  coin, never evidence of it. The DHT discovers; the chain verifies. See SPEC.md 6.9.
   Announced at the `k` nodes closest to the content key, **TTL'd**, and **republished** before
   expiry so offline providers age out automatically.
 

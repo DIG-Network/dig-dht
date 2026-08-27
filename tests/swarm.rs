@@ -931,6 +931,12 @@ struct CannedAnswer {
     provider: PeerId,
     /// Contacts returned as `closer` — how a lying peer can still refer the finder onward.
     closer: Vec<Contact>,
+    /// The `unverified_mirror_coin_id` the returned record carries, verbatim and un-normalized.
+    ///
+    /// A double that could only ever answer `None` here could not express a lie about this field at
+    /// all, so no test written against it could distinguish "the finder normalizes the pointer" from
+    /// "no peer ever sent a bad one". `Default` is `None`, which is what a conforming peer sends.
+    pointer: Option<String>,
 }
 
 /// A transport that answers each peer's `find_providers` from a canned script — the misbehaviour
@@ -971,7 +977,7 @@ impl DhtTransport for StampingTransport {
                     provider_peer_id: answer.provider.to_hex(),
                     addresses: addr(),
                     expires_at: u64::MAX,
-                    unverified_mirror_coin_id: None,
+                    unverified_mirror_coin_id: answer.pointer.clone(),
                 }],
                 closer: answer.closer.clone(),
             }),
@@ -1016,6 +1022,7 @@ async fn seeker_against_stamping_peer(answer_content_key: String) -> Arc<DhtServ
                     stamped_key: StampedKey::Fixed(answer_content_key),
                     provider: responder,
                     closer: vec![],
+                    pointer: None,
                 },
             )]),
         }),
@@ -1084,6 +1091,7 @@ async fn a_lying_first_hop_does_not_hide_a_genuine_holder_further_along() {
                     // The lie is accompanied by a genuine referral, so the ONLY thing that can stop
                     // the walk reaching the holder is the early exit the off-key record would trip.
                     closer: vec![Contact::new(&holder, addr())],
+                    pointer: None,
                 },
             ),
             (
@@ -1092,6 +1100,7 @@ async fn a_lying_first_hop_does_not_hide_a_genuine_holder_further_along() {
                     stamped_key: StampedKey::Queried,
                     provider: holder,
                     closer: vec![],
+                    pointer: None,
                 },
             ),
         ]),
@@ -1338,6 +1347,7 @@ async fn a_cached_record_expiry_is_clamped_down_to_the_discovery_cache_ttl() {
                 stamped_key: StampedKey::Queried,
                 provider: responder,
                 closer: vec![],
+                pointer: None,
             },
         )]),
     )
@@ -1390,6 +1400,7 @@ async fn a_record_naming_this_node_is_never_cached() {
                 stamped_key: StampedKey::Queried,
                 provider: echoed_self,
                 closer: vec![],
+                pointer: None,
             },
         )]),
     )
@@ -1412,4 +1423,51 @@ async fn a_record_naming_this_node_is_never_cached() {
         rpcs.load(Ordering::SeqCst) > 0,
         "so an echoed self-record cannot pin this node to a provider set it cannot use"
     );
+}
+
+/// Admission rule 3: the discovery cache normalizes `unverified_mirror_coin_id`, exactly as the
+/// authoritative store does and exactly as the sibling `addresses` field is already re-capped for
+/// these same records.
+///
+/// A conforming transport cannot deliver an oversized pointer here today, which is why this is
+/// defence in depth rather than a live fix — but "cannot arrive" is a property of the transport, not
+/// of this write path, and the cache should hold the same shape whatever reaches it.
+///
+/// Two cases, because "clears the field" and "normalizes the field" are different implementations:
+/// an oversized pointer must not be cached, and a canonical one must survive untouched.
+#[tokio::test]
+async fn a_cached_record_pointer_is_normalized() {
+    const VALID: &str = "e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7";
+
+    // Sized FROM the protocol's own ceiling — the length that makes a record unservable.
+    let oversized = "a".repeat(dig_dht::wire::MAX_FRAMED_BODY);
+
+    for (seed, pointer, expected) in [
+        (0xB1u8, oversized, None),
+        (0xB2u8, VALID.to_string(), Some(VALID.to_string())),
+    ] {
+        let wanted = ContentId::store([seed; 32]);
+        let responder = pid(0xEE, 0x01);
+        let seeker = scripted_seeker(
+            &[responder],
+            HashMap::from([(
+                responder.to_hex(),
+                CannedAnswer {
+                    stamped_key: StampedKey::Queried,
+                    provider: responder,
+                    closer: vec![],
+                    pointer: Some(pointer),
+                },
+            )]),
+        )
+        .await;
+
+        seeker.find_providers(&wanted).await.unwrap();
+        let cached = seeker.cached_providers(&wanted).await;
+        assert_eq!(cached.len(), 1, "the discovered record should be cached");
+        assert_eq!(
+            cached[0].unverified_mirror_coin_id, expected,
+            "the cache must hold the pointer in the same normalized shape as the authoritative store"
+        );
+    }
 }
