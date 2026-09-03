@@ -392,7 +392,7 @@ pub struct ProviderRecord {
     pub expires_at: u64,
     /// **UNTRUSTED POINTER, NOT EVIDENCE** — an optional 64-hex mirror-coin id the publisher claims
     /// bonds this `(store, root)` claim, carried so a verifier can fetch ONE coin instead of
-    /// scanning by hint.
+    /// searching for it.
     ///
     /// Holding this proves nothing whatsoever. Any peer can publish any 32 bytes, and a hostile or
     /// merely stale publisher can supply a real, well-formed, fully-collateralised coin id that
