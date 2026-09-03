@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.16.0] - 2026-09-03
+
+### Documentation
+- **record:** Correct the mirror-pointer fallback claim across record.rs, SPEC.md and service.rs (#29)
+
 ## [0.15.0] - 2026-08-27
 
 ### Bug Fixes
