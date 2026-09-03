@@ -392,7 +392,7 @@ pub struct ProviderRecord {
     pub expires_at: u64,
     /// **UNTRUSTED POINTER, NOT EVIDENCE** — an optional 64-hex mirror-coin id the publisher claims
     /// bonds this `(store, root)` claim, carried so a verifier can fetch ONE coin instead of
-    /// scanning by hint.
+    /// searching for it.
     ///
     /// Holding this proves nothing whatsoever. Any peer can publish any 32 bytes, and a hostile or
     /// merely stale publisher can supply a real, well-formed, fully-collateralised coin id that
@@ -413,12 +413,22 @@ pub struct ProviderRecord {
     /// **Absence is normal and must never degrade discovery.** Old publishers, publishers that have
     /// not created the coin yet, and publishers mid-epoch-rollover all legitimately omit it; a
     /// republished record can also carry a pointer that has since gone stale across an epoch
-    /// boundary. The fallback is the existing hint scan (`dig-mirror-coin`'s `discover` / `list`),
-    /// which is slower, not weaker. Treating a missing pointer as "uncollateralised" is a defect.
+    /// boundary. **A store-granularity record can never carry one at all**, since a mirror coin
+    /// bonds `(store, root, owner, epoch)` and a store-granularity claim names no root. Treating a
+    /// missing pointer as "uncollateralised" is a defect.
+    ///
+    /// **There is no equally cheap fallback, and none is required.** `dig_mirror_coin::discover`
+    /// cannot serve as one: it takes `owner_puzzle_hash` as a required parameter, because the hint
+    /// is morphed from the owner, and a provider record carries no owner. An owner-less scan of the
+    /// shared mirror puzzle hash is not merely slower — it is truncated at `MAX_CANDIDATES` on a
+    /// list anyone may extend for the price of a dust coin, so its "not found" is not a negative a
+    /// verifier may act on, and it turns one free inbound record into an unbounded outbound read. A
+    /// consumer that cannot fetch a pointer therefore **withholds credit and leaves the holder's
+    /// ranking unchanged**; it does not demote.
     ///
     /// **A wrong pointer costs the publisher, not the verifier.** One chain read, no retry loop: a
-    /// lookup that misses or fails the bond check falls straight back to the hint scan. A mismatch
-    /// is not grounds for blocklisting — it is indistinguishable from an epoch rollover.
+    /// lookup that misses or fails the bond check yields no credit for that holder. A mismatch is
+    /// not grounds for blocklisting — it is indistinguishable from an epoch rollover.
     ///
     /// Malformed values normalize to `None` at the wire boundary and again at admission, so on an
     /// ADMITTED or STORED record this is either a canonical lowercase 64-hex string or absent. That

@@ -293,13 +293,13 @@ impl DhtService {
     }
 
     /// As [`announce_provider`](Self::announce_provider), but also publishing this node's claimed
-    /// mirror-coin id so a verifier can fetch ONE coin instead of scanning by hint.
+    /// mirror-coin id so a verifier can fetch ONE coin instead of searching for it.
     ///
     /// The pointer is per-content because a mirror coin bonds a `(store, root, owner, epoch)`
     /// tuple, and it is remembered so every [`republish`](Self::republish) re-attaches it. Pass
     /// `None` — or call [`announce_provider`](Self::announce_provider) — when there is no coin yet;
-    /// **absence is a normal, fully-supported state**, not a degraded one, since the verifier's
-    /// fallback is the hint scan.
+    /// **absence is a normal, fully-supported state**, not a degraded one, since a verifier that
+    /// cannot fetch a pointer withholds credit rather than demoting.
     ///
     /// To refresh the pointer across an epoch rollover, announce again with the new coin id.
     ///
