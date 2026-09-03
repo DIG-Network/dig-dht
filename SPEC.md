@@ -555,11 +555,10 @@ those claims is actually bonded. This field makes step two a direct lookup inste
 
 - **Optional, and absence is normal.** A record MAY carry a 64-hex mirror-coin id. Old publishers,
   publishers that have not created the coin yet, and publishers mid-epoch-rollover all legitimately
-  omit it. A verifier can always fall back to the hint scan, because all four terms of
-  `mirror_hint(store_launcher_id, root_hash, owner_puzzle_hash, epoch)` are known by then — store
-  and root from the claim, owner puzzle hash from the provider entry, epoch from the clock. **A node
-  that omits the pointer is slower to verify, not unverifiable, and MUST NOT be treated as
-  uncollateralised.**
+  omit it. A node that omits the pointer is **not verifiable through this mechanism**, and MUST NOT
+  be treated as uncollateralised: a verifier withholds credit and leaves its ranking unchanged.
+  There is no fallback search — `mirror_hint` is morphed from the owner puzzle hash, which a
+  provider record does not carry.
 - **It is a POINTER, never evidence.** The publishing peer is untrusted (§14). A hostile or stale
   peer can supply a real, well-formed, fully-collateralised coin id that bonds a DIFFERENT store,
   root, epoch or owner — every property checks out except the one that matters.
@@ -573,8 +572,8 @@ those claims is actually bonded. This field makes step two a direct lookup inste
   Step 4 is what binds the coin to the claim; steps 1-3 alone prove only that *a* valid mirror coin
   exists somewhere.
 - **A wrong pointer costs the publisher, not the verifier.** Verification MUST be bounded to a
-  single chain read with no retry loop, falling straight back to the hint scan on a miss or a failed
-  bond check. A mismatch MUST NOT be grounds for blocklisting — it is indistinguishable from an
+  single chain read with no retry loop; a miss or a failed bond check simply yields no credit for
+  that holder. A mismatch MUST NOT be grounds for blocklisting — it is indistinguishable from an
   epoch rollover.
 - **Normalization at EVERY ingress (wire contract).** A responder MUST NOT trust the field as
   received, and MUST normalize it in the admission pipeline (§6.3) and not only when decoding a
@@ -590,6 +589,16 @@ those claims is actually bonded. This field makes step two a direct lookup inste
   node for a full TTL, which is the exact denial this rule exists to prevent.
 - **No verification in this crate.** The DHT has no chain source. It carries the pointer and states
   that it is untrusted; verification belongs to the consumer.
+- **A store-granularity record is unbondable by construction.** A mirror coin bonds
+  `(store, root, owner, epoch)`, and `ContentId::Store` names no root, so a store-granularity
+  provider record can never carry a pointer. A holder that announces at both granularities — which
+  the consumer node does — therefore always has a pointer-less record alongside a pointered one.
+  That is the specified shape, not a gap: a measurement finding that a large share of all records
+  carry no pointer has measured this, and MUST NOT be read as uncollateralised holders.
+- **`content_key` is a hash of the content id, not the id.** A consumer MUST verify a record
+  against the content id it queried for. A record read OUTSIDE query context — relayed, stored, or
+  replayed — carries no recoverable `(store, root)`, and so is not verifiable at all, pointer or no
+  pointer.
 
 
 ## 7. Routing table
