@@ -4,6 +4,11 @@ All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org) and
 [Conventional Commits](https://www.conventionalcommits.org).
 
+## [0.16.1] - 2026-09-04
+
+### Documentation
+- Add CONTRIBUTING.md (#30)
+
 ## [0.16.0] - 2026-09-03
 
 ### Documentation
